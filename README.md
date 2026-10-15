@@ -15,3 +15,7 @@ A small native macOS picture viewer (Swift / AppKit).
 ```
 
 Requires the Xcode Command Line Tools (`swiftc`). The app is ad-hoc signed; on first launch right-click → Open.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
