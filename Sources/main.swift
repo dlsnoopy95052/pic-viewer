@@ -1,3 +1,4 @@
+import Carbon.HIToolbox
 import Cocoa
 import CoreImage
 import ImageIO
@@ -43,10 +44,16 @@ final class ImageCanvas: NSView {
                 zoom = nil; offset = .zero; quarterTurns = 0; cropRect = nil; drawPoints = []
                 annotations = []; selected = nil
             }
+            baseCG = image.flatMap { ImageEdit.cgImage($0) }
             needsDisplay = true
         }
     }
     private var preserveView = false
+    private var baseCG: CGImage?
+    private var baseInfo: (cg: CGImage, size: NSSize)? {
+        guard let cg = baseCG, let image else { return nil }
+        return (cg, image.size)
+    }
     /// Swap the picture without touching zoom / pan / rotation (live adjustment preview).
     func replaceImage(_ new: NSImage) {
         preserveView = true; image = new; preserveView = false
@@ -235,7 +242,9 @@ final class ImageCanvas: NSView {
                    hints: [.interpolation: NSImageInterpolation.high.rawValue])
         let iw = image.size.width, ih = image.size.height
         for a in annotations {
-            ImageEdit.draw(a, k: scale) { NSPoint(x: ($0.x - iw / 2) * scale, y: ($0.y - ih / 2) * scale) }
+            ImageEdit.draw(a, k: scale, base: baseInfo) {
+                NSPoint(x: ($0.x - iw / 2) * scale, y: ($0.y - ih / 2) * scale)
+            }
         }
         ctx.restoreGState()
 
@@ -303,7 +312,7 @@ final class ImageCanvas: NSView {
             let shape = Annotation(tool: tool, points: drawPoints,
                                    width: annotationWidth * ImageEdit.strokeScale(image.size),
                                    color: annotationColor)
-            ImageEdit.draw(shape, k: k) { NSPoint(x: ir.minX + $0.x * k, y: ir.minY + $0.y * k) }
+            ImageEdit.draw(shape, k: k, base: baseInfo) { NSPoint(x: ir.minX + $0.x * k, y: ir.minY + $0.y * k) }
         }
     }
 
@@ -602,10 +611,10 @@ enum ImageInfo {
 // MARK: - Editing operations
 
 enum AnnotationTool: Int {
-    case none, line, arrow, rect, ellipse, pen, text
+    case none, line, arrow, rect, ellipse, pen, text, mosaic
 
     /// Two-point shapes whose end points can be dragged.
-    var hasHandles: Bool { [.line, .arrow, .rect, .ellipse].contains(self) }
+    var hasHandles: Bool { [.line, .arrow, .rect, .ellipse, .mosaic].contains(self) }
 
     /// Shapes that get a rotation knob (lines and arrows already point anywhere via their end points).
     var canRotate: Bool { [.rect, .ellipse, .text].contains(self) }
@@ -688,7 +697,7 @@ enum ImageEdit {
                 path.move(to: b)
                 path.line(to: NSPoint(x: b.x + len * cos(angle + d), y: b.y + len * sin(angle + d)))
             }
-        case .rect: path.appendRect(box)
+        case .rect, .mosaic: path.appendRect(box)
         case .ellipse: path.appendOval(in: box)
         case .pen:
             path.move(to: a)
@@ -774,9 +783,14 @@ enum ImageEdit {
     }
 
     /// Draws into the current graphics context. `k` converts image points to drawing units.
-    static func draw(_ a: Annotation, k: CGFloat, map: (NSPoint) -> NSPoint) {
+    static func draw(_ a: Annotation, k: CGFloat, base: (cg: CGImage, size: NSSize)? = nil,
+                     map: (NSPoint) -> NSPoint) {
         NSGraphicsContext.saveGraphicsState()
         defer { NSGraphicsContext.restoreGraphicsState() }
+        if a.tool == .mosaic {
+            if let base { drawMosaic(a, base: base, map: map) }
+            return
+        }
         if a.angle != 0 { concatRotation(a.angle, about: map(center(of: a))) }
         if a.tool == .text {
             guard let p = a.points.first else { return }
@@ -802,8 +816,37 @@ enum ImageEdit {
         }
     }
 
+    /// Pixelates the part of the picture under the annotation. Block size follows the width setting.
+    static func drawMosaic(_ a: Annotation, base: (cg: CGImage, size: NSSize), map: (NSPoint) -> NSPoint) {
+        guard let ctx = NSGraphicsContext.current?.cgContext, a.points.count == 2,
+              base.size.width > 0, base.size.height > 0 else { return }
+        let (p, q) = (a.points[0], a.points[1])
+        let box = NSRect(x: min(p.x, q.x), y: min(p.y, q.y), width: abs(p.x - q.x), height: abs(p.y - q.y))
+        let r = box.intersection(NSRect(origin: .zero, size: base.size))
+        guard r.width >= 1, r.height >= 1 else { return }
+        let k = CGFloat(base.cg.width) / base.size.width
+        let px = CGRect(x: r.minX * k, y: (base.size.height - r.maxY) * k,
+                        width: r.width * k, height: r.height * k).integral
+        guard let crop = base.cg.cropping(to: px) else { return }
+        let block = max(2, a.width * 3)
+        let sw = max(1, Int((r.width / block).rounded(.up))), sh = max(1, Int((r.height / block).rounded(.up)))
+        guard let small = CGContext(data: nil, width: sw, height: sh, bitsPerComponent: 8, bytesPerRow: 0,
+                                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+        small.interpolationQuality = .high
+        small.draw(crop, in: CGRect(x: 0, y: 0, width: sw, height: sh))
+        guard let tiny = small.makeImage() else { return }
+        let a0 = map(r.origin), a1 = map(NSPoint(x: r.maxX, y: r.maxY))
+        ctx.saveGState()
+        ctx.interpolationQuality = .none
+        ctx.draw(tiny, in: CGRect(x: min(a0.x, a1.x), y: min(a0.y, a1.y),
+                                  width: abs(a1.x - a0.x), height: abs(a1.y - a0.y)))
+        ctx.restoreGState()
+    }
+
     /// Smallest distance (image points) from `p` to the annotation's outline.
     static func distance(from point: NSPoint, to a: Annotation) -> CGFloat {
+        if a.tool == .mosaic { return bounds(of: a).contains(point) ? 0 : .greatestFiniteMagnitude }
         let p = a.angle == 0 ? point : rotated(point, about: center(of: a), by: -a.angle)
         if a.tool == .text { return textRect(a).contains(p) ? 0 : .greatestFiniteMagnitude }
         let flat = path(for: a, headScale: 1) { $0 }.flattened
@@ -833,7 +876,7 @@ enum ImageEdit {
         rasterize(image) { ctx, s, _, cg in
             ctx.draw(cg, in: CGRect(origin: .zero, size: s))
             withGraphics(ctx) {
-                for a in annotations { draw(a, k: 1) { $0 } }
+                for a in annotations { draw(a, k: 1, base: (cg, s)) { $0 } }
             }
         }
     }
@@ -1088,6 +1131,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let fontPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let boldButton = NSButton()
     private let italicButton = NSButton()
+    private var capturing = false
+    private var hotKeyRef: EventHotKeyRef?
+    private var copyCaptures: Bool {
+        get { UserDefaults.standard.bool(forKey: "copyCaptures") }
+        set { UserDefaults.standard.set(newValue, forKey: "copyCaptures") }
+    }
     private var undoStack: [(image: NSImage?, annotations: [Annotation])] = []
     private var lastUndoWasStyle = false
     private var edited = false
@@ -1108,6 +1157,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func setUpIfNeeded() {
         guard !didSetUp else { return }
         didSetUp = true
+        UserDefaults.standard.register(defaults: ["copyCaptures": true])
+        registerCaptureHotKey()
         buildMenu()
         buildWindow()
     }
@@ -1197,6 +1248,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         infoButton = tool("info.circle", "Show info (I)", #selector(toggleInfo))
         thumbsButton = tool("square.grid.3x1.below.line.grid.1x2", "Show thumbnails (T)", #selector(toggleThumbnails))
         toolbar.setViews([
+            tool("camera.viewfinder", "Capture a screen area (⌥⌘4)", #selector(captureArea)),
             tool("rotate.left", "Rotate left (⌘[)", #selector(rotateLeft)),
             tool("rotate.right", "Rotate right (⌘])", #selector(rotateRight)),
             tool("minus.magnifyingglass", "Zoom out (⌘-)", #selector(zoomOut)),
@@ -1252,6 +1304,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             (.line, "line.diagonal", "Line"), (.arrow, "arrow.up.right", "Arrow"),
             (.rect, "rectangle", "Rectangle"), (.ellipse, "circle", "Circle / ellipse"),
             (.pen, "pencil.tip", "Freehand pen"), (.text, "textformat", "Text"),
+            (.mosaic, "squareshape.split.3x3", "Mosaic (pixelate an area; width sets block size)"),
         ]
         var annotViews: [NSView] = []
         for (t, symbol, name) in toolDefs {
@@ -1270,7 +1323,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         widthPopup.selectItem(at: 1)
         widthPopup.controlSize = .small
         widthPopup.font = .systemFont(ofSize: 11)
-        widthPopup.toolTip = "Line width / text size"
+        widthPopup.toolTip = "Line width / text size / mosaic block size"
         widthPopup.target = self
         widthPopup.action = #selector(styleChanged)
         bgWell.color = .clear
@@ -1758,6 +1811,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         ])
     }
 
+    /// Global ⌥⌘4, works while another app is in front (Carbon hot keys need no extra permission).
+    private func registerCaptureHotKey() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            DispatchQueue.main.async { (NSApp.delegate as? AppDelegate)?.captureArea() }
+            return noErr
+        }, 1, &spec, nil, nil)
+        let id = EventHotKeyID(signature: OSType(0x50565748), id: 1)
+        RegisterEventHotKey(UInt32(kVK_ANSI_4), UInt32(cmdKey | optionKey), id,
+                            GetApplicationEventTarget(), 0, &hotKeyRef)
+    }
+
+    @objc func toggleCopyCaptures() { copyCaptures.toggle() }
+
+    @objc func captureArea() {
+        guard !capturing else { return }
+        guard CGPreflightScreenCaptureAccess() else {
+            CGRequestScreenCaptureAccess()
+            let alert = NSAlert()
+            alert.messageText = "Screen Recording permission needed"
+            alert.informativeText = "Allow Picture Viewer in System Settings → Privacy & Security → Screen Recording, then reopen the app and try again."
+            alert.runModal()
+            return
+        }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("PictureViewerCaptures")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH.mm.ss"
+        let url = dir.appendingPathComponent("Capture \(fmt.string(from: Date())).png")
+
+        if slideshowTimer != nil { toggleSlideshow() }
+        capturing = true
+        window.orderOut(nil)                    // keep our own window out of the shot
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            task.arguments = ["-i", "-s", "-x", "-t", "png", url.path]   // area selection only, no sound
+            task.terminationHandler = { _ in
+                DispatchQueue.main.async {
+                    self.capturing = false
+                    self.window.makeKeyAndOrderFront(nil)
+                    NSApp.activate(ignoringOtherApps: true)
+                    // No file means the selection was cancelled (Esc).
+                    guard FileManager.default.fileExists(atPath: url.path) else { return }
+                    if self.copyCaptures, let img = NSImage(contentsOf: url) {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.writeObjects([img])
+                    }
+                    self.open(url)
+                }
+            }
+            do { try task.run() } catch {
+                capturing = false
+                window.makeKeyAndOrderFront(nil)
+                NSSound.beep()
+            }
+        }
+    }
+
     @objc func rotateLeft() { canvas.rotate(by: -1) }
     @objc func rotateRight() { canvas.rotate(by: 1) }
 
@@ -1893,6 +2005,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         case #selector(toggleSlideshow):
             item.title = slideshowTimer == nil ? "Start Slideshow" : "Stop Slideshow"
             return files.count > 1
+        case #selector(toggleCopyCaptures):
+            item.state = copyCaptures ? .on : .off
+            return true
         case #selector(toggleInfo):
             item.state = showInfo ? .on : .off
             return true
@@ -1943,6 +2058,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         let file = submenu("File")
         add(file, "Open…", #selector(openPanel), "o")
+        add(file, "Capture Screen Area", #selector(captureArea), "4", [.command, .option])
+        add(file, "Copy Captures to Clipboard", #selector(toggleCopyCaptures))
         file.addItem(.separator())
         add(file, "Page Setup…", #selector(pageSetup), "p", [.command, .shift])
         add(file, "Print…", #selector(printImage), "p")
