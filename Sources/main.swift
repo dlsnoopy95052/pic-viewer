@@ -78,6 +78,7 @@ final class ImageCanvas: NSView {
     }
     var annotationColor = NSColor.systemRed
     var annotationWidth: CGFloat = 4
+    var annotationBackground: NSColor?
     private var drawPoints: [NSPoint] = []
     var onShape: ((Annotation) -> Void)?
     var onText: ((NSPoint) -> Void)?
@@ -92,7 +93,7 @@ final class ImageCanvas: NSView {
     /// Called once, right before an interactive change mutates `annotations` (push undo here).
     var onBeginChange: (() -> Void)?
     var onEditText: ((Int) -> Void)?
-    private enum Drag { case none, move(NSPoint), handle(Int), rotate }
+    private enum Drag { case none, move(NSPoint), handle(Int), rotate, width }
     private var drag = Drag.none
     private var dragStarted = false
 
@@ -122,6 +123,12 @@ final class ImageCanvas: NSView {
         let b = ImageEdit.bounds(of: a)
         let c = ImageEdit.center(of: a)
         return ImageEdit.rotated(NSPoint(x: c.x, y: b.maxY + 26 / k), about: c, by: a.angle)
+    }
+
+    private func isOnWidthHandle(_ p: NSPoint) -> Bool {
+        guard let i = selected, annotations.indices.contains(i), annotations[i].tool == .text else { return false }
+        let q = ImageEdit.widthHandle(for: annotations[i])
+        return hypot(q.x - p.x, q.y - p.y) <= 9 / max(zoom ?? fitScale, 0.0001)
     }
 
     private func isOnRotationKnob(_ p: NSPoint) -> Bool {
@@ -254,6 +261,13 @@ final class ImageCanvas: NSView {
                 NSColor.white.setFill(); dot.fill()
                 NSColor.controlAccentColor.setStroke(); dot.lineWidth = 1.5; dot.stroke()
             }
+            if a.tool == .text {
+                let r = ImageEdit.textRect(a)
+                let c = v(NSPoint(x: r.maxX, y: r.midY))
+                let h = NSBezierPath(rect: NSRect(x: c.x - 3, y: c.y - 8, width: 6, height: 16))
+                NSColor.white.setFill(); h.fill()
+                NSColor.controlAccentColor.setStroke(); h.lineWidth = 1.5; h.stroke()
+            }
             if a.tool.hasHandles {
                 for q in a.points {
                     let c = v(q)
@@ -377,6 +391,10 @@ final class ImageCanvas: NSView {
                 a.points[j] = ImageEdit.rotated(opp, about: c, by: -a.angle)
                 annotations[i] = a
                 return
+            case .width:
+                if !dragStarted { onBeginChange?(); dragStarted = true }
+                ImageEdit.setWrapWidth(&annotations[i], mouse: p)
+                return
             case .rotate:
                 if !dragStarted { onBeginChange?(); dragStarted = true }
                 let c = ImageEdit.center(of: annotations[i])
@@ -418,6 +436,15 @@ final class ImageCanvas: NSView {
         }
         if image != nil, quarterTurns == 0, !annotations.isEmpty {
             let p = toImage(convert(event.locationInWindow, from: nil))
+            if isOnWidthHandle(p), let i = selected {
+                if event.clickCount == 2 {
+                    onBeginChange?()
+                    annotations[i].boxWidth = nil     // double-click: back to no wrapping
+                } else {
+                    drag = .width
+                }
+                return
+            }
             if isOnRotationKnob(p) {
                 drag = .rotate
                 return
@@ -592,6 +619,9 @@ struct Annotation {
     var fontSize: CGFloat = 0
     /// Radians, counter-clockwise, about the annotation's center (rect / ellipse / text only).
     var angle: CGFloat = 0
+    /// Text only: wrap width of the text area in image points (nil = no wrapping) and fill behind it.
+    var boxWidth: CGFloat?
+    var background: NSColor?
 }
 
 enum ImageEdit {
@@ -666,12 +696,38 @@ enum ImageEdit {
             .font: NSFont.boldSystemFont(ofSize: size), .foregroundColor: color])
     }
 
-    /// Text box in image points (anchor point is its top-left).
+    /// Text layout in image points: padding, text area size and the attributed string.
+    static func textLayout(_ a: Annotation) -> (pad: CGFloat, size: NSSize, str: NSAttributedString) {
+        let str = attributed(a.text, size: a.fontSize, color: a.color)
+        let r = str.boundingRect(with: NSSize(width: a.boxWidth ?? 100_000, height: 100_000),
+                                 options: [.usesLineFragmentOrigin])
+        return (a.fontSize * 0.25, NSSize(width: a.boxWidth ?? ceil(r.width) + 2, height: ceil(r.height)), str)
+    }
+
+    /// Text box (including padding) in image points; the anchor point is its top-left.
     static func textRect(_ a: Annotation) -> NSRect {
         guard let p = a.points.first else { return .zero }
-        let box = attributed(a.text, size: a.fontSize, color: .black)
-            .boundingRect(with: NSSize(width: 100_000, height: 100_000), options: [.usesLineFragmentOrigin])
-        return NSRect(x: p.x, y: p.y - box.height, width: box.width + 4, height: box.height)
+        let l = textLayout(a)
+        let w = l.size.width + 2 * l.pad, h = l.size.height + 2 * l.pad
+        return NSRect(x: p.x, y: p.y - h, width: w, height: h)
+    }
+
+    /// Wrap-width handle (right edge, vertically centered), in image points, rotation applied.
+    static func widthHandle(for a: Annotation) -> NSPoint {
+        let r = textRect(a)
+        return rotated(NSPoint(x: r.maxX, y: r.midY), about: center(of: a), by: a.angle)
+    }
+
+    /// Set the wrap width from a mouse position, keeping the box's top-left corner fixed in the picture.
+    static func setWrapWidth(_ a: inout Annotation, mouse m: NSPoint) {
+        guard let p0 = a.points.first else { return }
+        let top = rotated(p0, about: center(of: a), by: a.angle)
+        let along = (m.x - top.x) * cos(a.angle) + (m.y - top.y) * sin(a.angle)
+        a.boxWidth = max(along - 2 * a.fontSize * 0.25, a.fontSize)
+        let r = textRect(a)                      // size under the new width, at the old anchor
+        let d = NSPoint(x: r.width / 2, y: -r.height / 2)
+        let rd = rotated(NSPoint(x: d.x, y: d.y), about: .zero, by: a.angle)
+        a.points[0] = NSPoint(x: top.x - d.x + rd.x, y: top.y - d.y + rd.y)
     }
 
     static func bounds(of a: Annotation) -> NSRect {
@@ -708,11 +764,19 @@ enum ImageEdit {
         if a.tool == .text {
             guard let p = a.points.first else { return }
             let o = map(p)
-            let str = attributed(a.text, size: a.fontSize * k, color: a.color)
-            let box = str.boundingRect(with: NSSize(width: 100_000, height: 100_000),
-                                       options: [.usesLineFragmentOrigin])
-            str.draw(with: NSRect(x: o.x, y: o.y - box.height, width: box.width + 4, height: box.height),
-                     options: [.usesLineFragmentOrigin])
+            let t = NSAffineTransform()
+            t.translateX(by: o.x, yBy: o.y)
+            t.scale(by: k)
+            t.concat()
+            let l = textLayout(a)
+            let w = l.size.width + 2 * l.pad, h = l.size.height + 2 * l.pad
+            if let bg = a.background {
+                bg.setFill()
+                NSBezierPath(roundedRect: NSRect(x: 0, y: -h, width: w, height: h),
+                             xRadius: l.pad, yRadius: l.pad).fill()
+            }
+            l.str.draw(with: NSRect(x: l.pad, y: -h + l.pad, width: l.size.width, height: l.size.height),
+                       options: [.usesLineFragmentOrigin])
         } else {
             let path = path(for: a, headScale: k, map: map)
             path.lineWidth = a.width * k
@@ -1000,6 +1064,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let colorWell = NSColorWell()
     private let widthPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let widthValues: [CGFloat] = [2, 4, 7, 12]
+    private let bgWell = NSColorWell()
+    private let bgLabel = NSTextField(labelWithString: "Bg")
+    private let noBgButton = NSButton()
     private var undoStack: [(image: NSImage?, annotations: [Annotation])] = []
     private var lastUndoWasStyle = false
     private var edited = false
@@ -1049,7 +1116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         window.title = "Picture Viewer"
-        window.minSize = NSSize(width: 960, height: 280)
+        window.minSize = NSSize(width: 1040, height: 280)
         window.delegate = self
         window.center()
         window.setFrameAutosaveName("MainWindow")
@@ -1185,7 +1252,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         widthPopup.toolTip = "Line width / text size"
         widthPopup.target = self
         widthPopup.action = #selector(styleChanged)
-        annotViews += [colorWell, widthPopup]
+        bgWell.color = .clear
+        bgWell.target = self
+        bgWell.action = #selector(styleChanged)
+        bgWell.toolTip = "Text background color"
+        bgWell.widthAnchor.constraint(equalToConstant: 32).isActive = true
+        bgWell.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        bgLabel.font = .systemFont(ofSize: 11)
+        bgLabel.textColor = NSColor(white: 1, alpha: 0.85)
+        noBgButton.image = NSImage(systemSymbolName: "circle.slash", accessibilityDescription: "No background")?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+        noBgButton.isBordered = false
+        noBgButton.imagePosition = .imageOnly
+        noBgButton.contentTintColor = NSColor(white: 1, alpha: 0.85)
+        noBgButton.toolTip = "No text background"
+        noBgButton.target = self
+        noBgButton.action = #selector(clearBackground)
+        [bgLabel, bgWell, noBgButton].forEach { $0.isHidden = true }
+        annotViews += [colorWell, widthPopup, bgLabel, bgWell, noBgButton]
         annotBar.setViews(annotViews, in: .leading)
         annotBar.spacing = 4
         annotBar.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
@@ -1198,6 +1282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         annotBar.trailingAnchor.constraint(equalTo: editBar.leadingAnchor, constant: -8).isActive = true
         canvas.onToolChange = { [weak self] in
             guard let self else { return }
+            self.updateBackgroundControls()
             for (t, b) in self.toolButtons {
                 b.contentTintColor = self.canvas.tool == t ? .controlAccentColor : NSColor(white: 1, alpha: 0.85)
             }
@@ -1211,7 +1296,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         canvas.onBeginChange = { [weak self] in self?.pushUndo() }
         canvas.onEditText = { [weak self] i in self?.editText(i) }
-        canvas.onSelectionChange = { [weak self] in self?.syncStyleToSelection() }
+        canvas.onSelectionChange = { [weak self] in
+            self?.syncStyleToSelection()
+            self?.updateBackgroundControls()
+        }
         canvas.onText = { [weak self] p in self?.addText(at: p) }
         styleChanged()
 
@@ -1407,7 +1495,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         canvas.tool = t
     }
 
+    /// The background controls only matter for text.
+    private func updateBackgroundControls() {
+        var show = canvas.tool == .text
+        if let i = canvas.selected, canvas.annotations.indices.contains(i) {
+            show = show || canvas.annotations[i].tool == .text
+        }
+        [bgLabel, bgWell, noBgButton].forEach { $0.isHidden = !show }
+    }
+
+    @objc private func clearBackground() {
+        bgWell.color = .clear
+        styleChanged()
+    }
+
     @objc private func styleChanged() {
+        canvas.annotationBackground = bgWell.color.alphaComponent > 0 ? bgWell.color : nil
         canvas.annotationColor = colorWell.color
         canvas.annotationWidth = widthValues[max(0, widthPopup.indexOfSelectedItem)]
         guard let i = canvas.selected, canvas.annotations.indices.contains(i), let img = currentImage else { return }
@@ -1415,7 +1518,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let scale = ImageEdit.strokeScale(img.size)
         canvas.annotations[i].color = canvas.annotationColor
         canvas.annotations[i].width = canvas.annotationWidth * scale
-        if canvas.annotations[i].tool == .text { canvas.annotations[i].fontSize = canvas.annotationWidth * 6 * scale }
+        if canvas.annotations[i].tool == .text {
+            canvas.annotations[i].fontSize = canvas.annotationWidth * 6 * scale
+            canvas.annotations[i].background = canvas.annotationBackground
+        }
     }
 
     /// Show the selected annotation's color / width in the style controls.
@@ -1429,19 +1535,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         widthPopup.selectItem(at: nearest)
         canvas.annotationColor = a.color
         canvas.annotationWidth = widthValues[nearest]
+        if a.tool == .text {
+            bgWell.color = a.background ?? .clear
+            canvas.annotationBackground = a.background
+        }
     }
 
     private func promptText(title: String, initial: String) -> String? {
         let alert = NSAlert()
         alert.messageText = title
+        alert.informativeText = "Press Return for a new line."
         alert.addButton(withTitle: "OK")
         alert.addButton(withTitle: "Cancel")
-        let field = NSTextField(string: initial)
-        field.frame = NSRect(x: 0, y: 0, width: 300, height: 24)
-        alert.accessoryView = field
-        alert.window.initialFirstResponder = field
-        guard alert.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty else { return nil }
-        return field.stringValue
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 320, height: 100))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let textView = NSTextView(frame: scroll.bounds)
+        textView.isRichText = false
+        textView.font = .systemFont(ofSize: 13)
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.string = initial
+        scroll.documentView = textView
+        alert.accessoryView = scroll
+        alert.window.initialFirstResponder = textView
+        guard alert.runModal() == .alertFirstButtonReturn, !textView.string.isEmpty else { return nil }
+        return textView.string
     }
 
     private func addText(at point: NSPoint) {
@@ -1453,7 +1572,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let scale = ImageEdit.strokeScale(img.size)
         canvas.annotations.append(Annotation(tool: .text, points: [point], width: canvas.annotationWidth * scale,
                                              color: canvas.annotationColor, text: text,
-                                             fontSize: canvas.annotationWidth * 6 * scale))
+                                             fontSize: canvas.annotationWidth * 6 * scale,
+                                             background: canvas.annotationBackground))
         canvas.tool = .none
         canvas.selected = canvas.annotations.count - 1
     }
