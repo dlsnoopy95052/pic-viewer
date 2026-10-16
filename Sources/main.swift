@@ -79,6 +79,9 @@ final class ImageCanvas: NSView {
     var annotationColor = NSColor.systemRed
     var annotationWidth: CGFloat = 4
     var annotationBackground: NSColor?
+    var annotationFont = ""
+    var annotationBold = true
+    var annotationItalic = false
     private var drawPoints: [NSPoint] = []
     var onShape: ((Annotation) -> Void)?
     var onText: ((NSPoint) -> Void)?
@@ -622,6 +625,10 @@ struct Annotation {
     /// Text only: wrap width of the text area in image points (nil = no wrapping) and fill behind it.
     var boxWidth: CGFloat?
     var background: NSColor?
+    /// Font family ("" = system font) and traits.
+    var fontName = ""
+    var bold = true
+    var italic = false
 }
 
 enum ImageEdit {
@@ -691,14 +698,24 @@ enum ImageEdit {
         return path
     }
 
-    private static func attributed(_ text: String, size: CGFloat, color: NSColor) -> NSAttributedString {
-        NSAttributedString(string: text, attributes: [
-            .font: NSFont.boldSystemFont(ofSize: size), .foregroundColor: color])
+    static func font(for a: Annotation) -> NSFont {
+        let fm = NSFontManager.shared
+        var f = a.fontName.isEmpty
+            ? NSFont.systemFont(ofSize: a.fontSize)
+            : (fm.font(withFamily: a.fontName, traits: [], weight: 5, size: a.fontSize)
+               ?? NSFont.systemFont(ofSize: a.fontSize))
+        if a.bold { f = fm.convert(f, toHaveTrait: .boldFontMask) }
+        if a.italic { f = fm.convert(f, toHaveTrait: .italicFontMask) }
+        return f
+    }
+
+    private static func attributed(for a: Annotation) -> NSAttributedString {
+        NSAttributedString(string: a.text, attributes: [.font: font(for: a), .foregroundColor: a.color])
     }
 
     /// Text layout in image points: padding, text area size and the attributed string.
     static func textLayout(_ a: Annotation) -> (pad: CGFloat, size: NSSize, str: NSAttributedString) {
-        let str = attributed(a.text, size: a.fontSize, color: a.color)
+        let str = attributed(for: a)
         let r = str.boundingRect(with: NSSize(width: a.boxWidth ?? 100_000, height: 100_000),
                                  options: [.usesLineFragmentOrigin])
         return (a.fontSize * 0.25, NSSize(width: a.boxWidth ?? ceil(r.width) + 2, height: ceil(r.height)), str)
@@ -1067,6 +1084,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let bgWell = NSColorWell()
     private let bgLabel = NSTextField(labelWithString: "Bg")
     private let noBgButton = NSButton()
+    private let textBar = NSStackView()
+    private let fontPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let boldButton = NSButton()
+    private let italicButton = NSButton()
     private var undoStack: [(image: NSImage?, annotations: [Annotation])] = []
     private var lastUndoWasStyle = false
     private var edited = false
@@ -1268,8 +1289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         noBgButton.toolTip = "No text background"
         noBgButton.target = self
         noBgButton.action = #selector(clearBackground)
-        [bgLabel, bgWell, noBgButton].forEach { $0.isHidden = true }
-        annotViews += [colorWell, widthPopup, bgLabel, bgWell, noBgButton]
+        annotViews += [colorWell, widthPopup]
         annotBar.setViews(annotViews, in: .leading)
         annotBar.spacing = 4
         annotBar.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
@@ -1280,6 +1300,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         content.addSubview(annotBar)
         annotBar.topAnchor.constraint(equalTo: toolbar.topAnchor).isActive = true
         annotBar.trailingAnchor.constraint(equalTo: editBar.leadingAnchor, constant: -8).isActive = true
+
+        // Text-only options, in their own bar under the annotation tools.
+        let wanted = ["Helvetica Neue", "Arial", "Times New Roman", "Georgia", "Verdana",
+                      "Courier New", "Menlo", "Marker Felt", "Impact"]
+        let available = Set(NSFontManager.shared.availableFontFamilies)
+        fontPopup.addItems(withTitles: ["System"] + wanted.filter(available.contains))
+        fontPopup.controlSize = .small
+        fontPopup.font = .systemFont(ofSize: 11)
+        fontPopup.toolTip = "Font"
+        fontPopup.target = self
+        fontPopup.action = #selector(styleChanged)
+        for (b, symbol, tip) in [(boldButton, "bold", "Bold"), (italicButton, "italic", "Italic")] {
+            b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)?
+                .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+            b.setButtonType(.toggle)
+            b.isBordered = false
+            b.imagePosition = .imageOnly
+            b.toolTip = tip
+            b.target = self
+            b.action = #selector(styleChanged)
+            b.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        }
+        boldButton.state = .on
+        textBar.setViews([fontPopup, boldButton, italicButton, bgLabel, bgWell, noBgButton], in: .leading)
+        textBar.spacing = 6
+        textBar.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
+        textBar.wantsLayer = true
+        textBar.layer?.backgroundColor = NSColor(white: 0, alpha: 0.6).cgColor
+        textBar.layer?.cornerRadius = 10
+        textBar.isHidden = true
+        textBar.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(textBar)
+        textBar.topAnchor.constraint(equalTo: annotBar.bottomAnchor, constant: 6).isActive = true
+        textBar.trailingAnchor.constraint(equalTo: annotBar.trailingAnchor).isActive = true
+        updateFontButtonTints()
+
         canvas.onToolChange = { [weak self] in
             guard let self else { return }
             self.updateBackgroundControls()
@@ -1501,7 +1557,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if let i = canvas.selected, canvas.annotations.indices.contains(i) {
             show = show || canvas.annotations[i].tool == .text
         }
-        [bgLabel, bgWell, noBgButton].forEach { $0.isHidden = !show }
+        textBar.isHidden = !show
+    }
+
+    private func updateFontButtonTints() {
+        for b in [boldButton, italicButton] {
+            b.contentTintColor = b.state == .on ? .controlAccentColor : NSColor(white: 1, alpha: 0.85)
+        }
     }
 
     @objc private func clearBackground() {
@@ -1511,6 +1573,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc private func styleChanged() {
         canvas.annotationBackground = bgWell.color.alphaComponent > 0 ? bgWell.color : nil
+        canvas.annotationFont = fontPopup.indexOfSelectedItem > 0 ? fontPopup.titleOfSelectedItem ?? "" : ""
+        canvas.annotationBold = boldButton.state == .on
+        canvas.annotationItalic = italicButton.state == .on
+        updateFontButtonTints()
         canvas.annotationColor = colorWell.color
         canvas.annotationWidth = widthValues[max(0, widthPopup.indexOfSelectedItem)]
         guard let i = canvas.selected, canvas.annotations.indices.contains(i), let img = currentImage else { return }
@@ -1521,6 +1587,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if canvas.annotations[i].tool == .text {
             canvas.annotations[i].fontSize = canvas.annotationWidth * 6 * scale
             canvas.annotations[i].background = canvas.annotationBackground
+            canvas.annotations[i].fontName = canvas.annotationFont
+            canvas.annotations[i].bold = canvas.annotationBold
+            canvas.annotations[i].italic = canvas.annotationItalic
         }
     }
 
@@ -1538,6 +1607,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if a.tool == .text {
             bgWell.color = a.background ?? .clear
             canvas.annotationBackground = a.background
+            fontPopup.selectItem(withTitle: a.fontName.isEmpty ? "System" : a.fontName)
+            boldButton.state = a.bold ? .on : .off
+            italicButton.state = a.italic ? .on : .off
+            canvas.annotationFont = a.fontName
+            canvas.annotationBold = a.bold
+            canvas.annotationItalic = a.italic
+            updateFontButtonTints()
         }
     }
 
@@ -1573,7 +1649,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         canvas.annotations.append(Annotation(tool: .text, points: [point], width: canvas.annotationWidth * scale,
                                              color: canvas.annotationColor, text: text,
                                              fontSize: canvas.annotationWidth * 6 * scale,
-                                             background: canvas.annotationBackground))
+                                             background: canvas.annotationBackground,
+                                             fontName: canvas.annotationFont,
+                                             bold: canvas.annotationBold, italic: canvas.annotationItalic))
         canvas.tool = .none
         canvas.selected = canvas.annotations.count - 1
     }
