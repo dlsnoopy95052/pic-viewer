@@ -1241,7 +1241,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         return alert.runModal() == .alertFirstButtonReturn
     }
 
-    func windowShouldClose(_ sender: NSWindow) -> Bool { confirmDiscard() }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard confirmDiscard() else { return false }
+        // Closing the last window quits the app, which would ask again.
+        edited = false
+        return true
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         confirmDiscard() ? .terminateNow : .terminateCancel
