@@ -1745,7 +1745,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func saveImage() {
         guard files.indices.contains(index), let img = canvas.rotatedImage else { return }
         let url = files[index]
-        guard ImageEdit.writableExtensions.contains(url.pathExtension.lowercased()) else { return saveCopy() }
+        // Pasted pictures only exist in a temp folder, so "Save" means "Save a Copy".
+        guard ImageEdit.writableExtensions.contains(url.pathExtension.lowercased()), !isPasted(url) else {
+            return saveCopy()
+        }
         let alert = NSAlert()
         alert.messageText = "Overwrite \"\(url.lastPathComponent)\"?"
         alert.informativeText = "The original file will be replaced. Use Save a Copy to keep it."
@@ -1770,8 +1773,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             ? src.pathExtension.lowercased() : "png"
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png, .jpeg, .tiff]
-        panel.directoryURL = src.deletingLastPathComponent()
-        panel.nameFieldStringValue = src.deletingPathExtension().lastPathComponent + " edited." + ext
+        if isPasted(src) {
+            panel.directoryURL = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first
+            panel.nameFieldStringValue = src.deletingPathExtension().lastPathComponent + "." + ext
+        } else {
+            panel.directoryURL = src.deletingLastPathComponent()
+            panel.nameFieldStringValue = src.deletingPathExtension().lastPathComponent + " edited." + ext
+        }
         guard panel.runModal() == .OK, let dest = panel.url else { return }
         guard let data = ImageEdit.encode(img, as: dest.pathExtension) else { NSSound.beep(); return }
         do {
@@ -1799,6 +1807,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             .applicationVersion: "Built \(built)",
             .version: "",
         ])
+    }
+
+    private static let pasteFolder = "PictureViewerPastes"
+
+    private func isPasted(_ url: URL) -> Bool {
+        url.deletingLastPathComponent().lastPathComponent == Self.pasteFolder
+    }
+
+    /// ⌘V: open a copied file, or an image copied from anywhere (screenshot, browser, another app).
+    @objc func pasteImage() {
+        let pb = NSPasteboard.general
+        if let urls = pb.readObjects(forClasses: [NSURL.self],
+                                     options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           let u = urls.first, FileManager.default.fileExists(atPath: u.path) {
+            open(u)
+            return
+        }
+        guard let img = NSImage(pasteboard: pb), let data = ImageEdit.encode(img, as: "png") else {
+            NSSound.beep()
+            return
+        }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(Self.pasteFolder)
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH.mm.ss"
+        let url = dir.appendingPathComponent("Pasted \(fmt.string(from: Date())).png")
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try data.write(to: url)
+            open(url)
+        } catch {
+            NSAlert(error: error).runModal()
+        }
     }
 
     @objc func rotateLeft() { canvas.rotate(by: -1) }
@@ -1936,6 +1976,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         case #selector(toggleSlideshow):
             item.title = slideshowTimer == nil ? "Start Slideshow" : "Stop Slideshow"
             return files.count > 1
+        case #selector(pasteImage):
+            let pb = NSPasteboard.general
+            return NSImage.canInit(with: pb)
+                || pb.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
         case #selector(toggleInfo):
             item.state = showInfo ? .on : .off
             return true
@@ -2002,6 +2046,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         add(edit, "Undo", #selector(undoEdit), "z")
         edit.addItem(.separator())
         add(edit, "Copy", #selector(copyImage), "c")
+        add(edit, "Paste", #selector(pasteImage), "v")
         edit.addItem(.separator())
         add(edit, "Crop", #selector(cropAction), "k")
         add(edit, "Flip Horizontally", #selector(flipHorizontal))
