@@ -39,7 +39,10 @@ enum Formats {
 final class ImageCanvas: NSView {
     var image: NSImage? {
         didSet {
-            if !preserveView { zoom = nil; offset = .zero; quarterTurns = 0; cropRect = nil; drawPoints = [] }
+            if !preserveView {
+                zoom = nil; offset = .zero; quarterTurns = 0; cropRect = nil; drawPoints = []
+                annotations = []; selected = nil
+            }
             needsDisplay = true
         }
     }
@@ -66,7 +69,7 @@ final class ImageCanvas: NSView {
     // Annotation drawing (points are in image points, origin bottom-left).
     var tool: AnnotationTool = .none {
         didSet {
-            if tool != .none { cropMode = false }
+            if tool != .none { cropMode = false; selected = nil }
             drawPoints = []
             needsDisplay = true
             window?.invalidateCursorRects(for: self)
@@ -76,9 +79,37 @@ final class ImageCanvas: NSView {
     var annotationColor = NSColor.systemRed
     var annotationWidth: CGFloat = 4
     private var drawPoints: [NSPoint] = []
-    var onShape: ((AnnotationShape) -> Void)?
+    var onShape: ((Annotation) -> Void)?
     var onText: ((NSPoint) -> Void)?
     var onToolChange: (() -> Void)?
+
+    // Placed annotations, selection and in-progress move / resize.
+    var annotations: [Annotation] = [] { didSet { needsDisplay = true } }
+    var selected: Int? {
+        didSet { needsDisplay = true; onSelectionChange?() }
+    }
+    var onSelectionChange: (() -> Void)?
+    /// Called once, right before an interactive change mutates `annotations` (push undo here).
+    var onBeginChange: (() -> Void)?
+    var onEditText: ((Int) -> Void)?
+    private enum Drag { case none, move(NSPoint), handle(Int) }
+    private var drag = Drag.none
+    private var dragStarted = false
+
+    private func annotationIndex(at p: NSPoint) -> Int? {
+        let k = zoom ?? fitScale
+        let tol = 7 / max(k, 0.0001)
+        for i in annotations.indices.reversed() {
+            if ImageEdit.distance(from: p, to: annotations[i]) <= max(annotations[i].width / 2, tol) { return i }
+        }
+        return nil
+    }
+
+    private func handleIndex(at p: NSPoint) -> Int? {
+        guard let i = selected, annotations.indices.contains(i), annotations[i].tool.hasHandles else { return nil }
+        let tol = 9 / max(zoom ?? fitScale, 0.0001)
+        return annotations[i].points.firstIndex { hypot($0.x - p.x, $0.y - p.y) <= tol }
+    }
 
     private func toImage(_ p: NSPoint) -> NSPoint {
         let ir = imageRect, s = image?.size ?? .zero
@@ -108,7 +139,15 @@ final class ImageCanvas: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { onEscape?() } else { super.keyDown(with: event) }
+        if event.keyCode == 53 {
+            onEscape?()
+        } else if event.keyCode == 51 || event.keyCode == 117, let i = selected, annotations.indices.contains(i) {
+            onBeginChange?()
+            annotations.remove(at: i)
+            selected = nil
+        } else {
+            super.keyDown(with: event)
+        }
     }
     /// Clockwise quarter turns applied to the view of the image (not to the file).
     private(set) var quarterTurns = 0
@@ -123,6 +162,7 @@ final class ImageCanvas: NSView {
     func rotate(by turns: Int) {
         cropMode = false
         tool = .none
+        selected = nil
         quarterTurns = ((quarterTurns + turns) % 4 + 4) % 4
         offset = .zero
         needsDisplay = true
@@ -163,7 +203,33 @@ final class ImageCanvas: NSView {
         image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1,
                    respectFlipped: true,
                    hints: [.interpolation: NSImageInterpolation.high.rawValue])
+        let iw = image.size.width, ih = image.size.height
+        for a in annotations {
+            ImageEdit.draw(a, k: scale) { NSPoint(x: ($0.x - iw / 2) * scale, y: ($0.y - ih / 2) * scale) }
+        }
         ctx.restoreGState()
+
+        if let i = selected, quarterTurns == 0, annotations.indices.contains(i) {
+            let a = annotations[i]
+            let ir = imageRect
+            func v(_ q: NSPoint) -> NSPoint { NSPoint(x: ir.minX + q.x * scale, y: ir.minY + q.y * scale) }
+            let b = ImageEdit.bounds(of: a)
+            let vr = NSRect(origin: v(b.origin), size: NSSize(width: b.width * scale, height: b.height * scale))
+                .insetBy(dx: -4, dy: -4)
+            let box = NSBezierPath(rect: vr)
+            box.lineWidth = 1
+            box.setLineDash([4, 3], count: 2, phase: 0)
+            NSColor.controlAccentColor.setStroke()
+            box.stroke()
+            if a.tool.hasHandles {
+                for q in a.points {
+                    let c = v(q)
+                    let h = NSBezierPath(rect: NSRect(x: c.x - 4, y: c.y - 4, width: 8, height: 8))
+                    NSColor.white.setFill(); h.fill()
+                    NSColor.controlAccentColor.setStroke(); h.lineWidth = 1.5; h.stroke()
+                }
+            }
+        }
 
         if cropMode {
             let path = NSBezierPath(rect: bounds)
@@ -183,14 +249,10 @@ final class ImageCanvas: NSView {
         if tool != .none, drawPoints.count >= 2 {
             let ir = imageRect
             let k = ir.width / image.size.width
-            let shape = AnnotationShape(tool: tool, points: drawPoints,
-                                        width: annotationWidth * ImageEdit.strokeScale(image.size))
-            let path = ImageEdit.path(for: shape, headScale: k) {
-                NSPoint(x: ir.minX + $0.x * k, y: ir.minY + $0.y * k)
-            }
-            path.lineWidth = shape.width * k
-            annotationColor.setStroke()
-            path.stroke()
+            let shape = Annotation(tool: tool, points: drawPoints,
+                                   width: annotationWidth * ImageEdit.strokeScale(image.size),
+                                   color: annotationColor)
+            ImageEdit.draw(shape, k: k) { NSPoint(x: ir.minX + $0.x * k, y: ir.minY + $0.y * k) }
         }
     }
 
@@ -202,8 +264,13 @@ final class ImageCanvas: NSView {
     func fit() { zoom = nil; offset = .zero; needsDisplay = true }
 
     /// The image with the current rotation baked in (for printing / copying).
-    var rotatedImage: NSImage? {
+    var flattenedImage: NSImage? {
         guard let image else { return nil }
+        return annotations.isEmpty ? image : (ImageEdit.renderAll(annotations, onto: image) ?? image)
+    }
+
+    var rotatedImage: NSImage? {
+        guard let image = flattenedImage else { return nil }
         let t = quarterTurns
         if t == 0 { return image }
         let s = image.size
@@ -237,9 +304,12 @@ final class ImageCanvas: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard tool != .none, drawPoints.count >= 2, let image else { return }
-        let shape = AnnotationShape(tool: tool, points: drawPoints,
-                                    width: annotationWidth * ImageEdit.strokeScale(image.size))
+        drag = .none
+        dragStarted = false
+        guard tool != .none, drawPoints.count >= 2, let image else { drawPoints = []; return }
+        let shape = Annotation(tool: tool, points: drawPoints,
+                               width: annotationWidth * ImageEdit.strokeScale(image.size),
+                               color: annotationColor)
         drawPoints = []
         needsDisplay = true
         onShape?(shape)
@@ -251,6 +321,22 @@ final class ImageCanvas: NSView {
             if tool == .pen { drawPoints.append(p) } else { drawPoints = [drawPoints[0], p] }
             needsDisplay = true
             return
+        }
+        if let i = selected, annotations.indices.contains(i) {
+            let p = toImage(convert(event.locationInWindow, from: nil))
+            switch drag {
+            case .move(let last):
+                if !dragStarted { onBeginChange?(); dragStarted = true }
+                let dx = p.x - last.x, dy = p.y - last.y
+                annotations[i].points = annotations[i].points.map { NSPoint(x: $0.x + dx, y: $0.y + dy) }
+                drag = .move(p)
+                return
+            case .handle(let h):
+                if !dragStarted { onBeginChange?(); dragStarted = true }
+                annotations[i].points[h] = p
+                return
+            case .none: break
+            }
         }
         if cropMode, let start = cropStart {
             let p = convert(event.locationInWindow, from: nil)
@@ -277,6 +363,23 @@ final class ImageCanvas: NSView {
             cropRect = nil
             needsDisplay = true
             return
+        }
+        if image != nil, quarterTurns == 0, !annotations.isEmpty {
+            let p = toImage(convert(event.locationInWindow, from: nil))
+            if let h = handleIndex(at: p) {
+                drag = .handle(h)
+                return
+            }
+            if let hit = annotationIndex(at: p) {
+                selected = hit
+                if event.clickCount == 2, annotations[hit].tool == .text {
+                    onEditText?(hit)
+                } else {
+                    drag = .move(p)
+                }
+                return
+            }
+            selected = nil
         }
         if event.clickCount == 2 {
             if zoom == nil { actualSize() } else { fit() }
@@ -414,12 +517,20 @@ enum ImageInfo {
 
 enum AnnotationTool: Int {
     case none, line, arrow, rect, ellipse, pen, text
+
+    /// Two-point shapes whose end points can be dragged.
+    var hasHandles: Bool { [.line, .arrow, .rect, .ellipse].contains(self) }
 }
 
-struct AnnotationShape {
+/// A mark drawn over the picture. Points are in image points, origin bottom-left.
+/// It stays editable (move / resize / restyle / delete) until the picture is flattened.
+struct Annotation {
     var tool: AnnotationTool
     var points: [NSPoint]
     var width: CGFloat
+    var color: NSColor
+    var text = ""
+    var fontSize: CGFloat = 0
 }
 
 enum ImageEdit {
@@ -460,7 +571,7 @@ enum ImageEdit {
     /// Stroke width / font size multiplier so marks look similar on small and huge pictures.
     static func strokeScale(_ size: NSSize) -> CGFloat { max(1, max(size.width, size.height) / 800) }
 
-    static func path(for shape: AnnotationShape, headScale: CGFloat,
+    static func path(for shape: Annotation, headScale: CGFloat,
                      map: (NSPoint) -> NSPoint) -> NSBezierPath {
         let pts = shape.points.map(map)
         let path = NSBezierPath()
@@ -489,29 +600,75 @@ enum ImageEdit {
         return path
     }
 
-    static func render(_ shape: AnnotationShape, color: NSColor, onto image: NSImage) -> NSImage? {
-        rasterize(image) { ctx, s, _, cg in
-            ctx.draw(cg, in: CGRect(origin: .zero, size: s))
-            withGraphics(ctx) {
-                let p = path(for: shape, headScale: 1) { $0 }
-                p.lineWidth = shape.width
-                color.setStroke()
-                p.stroke()
-            }
+    private static func attributed(_ text: String, size: CGFloat, color: NSColor) -> NSAttributedString {
+        NSAttributedString(string: text, attributes: [
+            .font: NSFont.boldSystemFont(ofSize: size), .foregroundColor: color])
+    }
+
+    /// Text box in image points (anchor point is its top-left).
+    static func textRect(_ a: Annotation) -> NSRect {
+        guard let p = a.points.first else { return .zero }
+        let box = attributed(a.text, size: a.fontSize, color: .black)
+            .boundingRect(with: NSSize(width: 100_000, height: 100_000), options: [.usesLineFragmentOrigin])
+        return NSRect(x: p.x, y: p.y - box.height, width: box.width + 4, height: box.height)
+    }
+
+    static func bounds(of a: Annotation) -> NSRect {
+        if a.tool == .text { return textRect(a) }
+        let xs = a.points.map(\.x), ys = a.points.map(\.y)
+        guard let x0 = xs.min(), let x1 = xs.max(), let y0 = ys.min(), let y1 = ys.max() else { return .zero }
+        return NSRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0).insetBy(dx: -a.width / 2, dy: -a.width / 2)
+    }
+
+    /// Draws into the current graphics context. `k` converts image points to drawing units.
+    static func draw(_ a: Annotation, k: CGFloat, map: (NSPoint) -> NSPoint) {
+        if a.tool == .text {
+            guard let p = a.points.first else { return }
+            let o = map(p)
+            let str = attributed(a.text, size: a.fontSize * k, color: a.color)
+            let box = str.boundingRect(with: NSSize(width: 100_000, height: 100_000),
+                                       options: [.usesLineFragmentOrigin])
+            str.draw(with: NSRect(x: o.x, y: o.y - box.height, width: box.width + 4, height: box.height),
+                     options: [.usesLineFragmentOrigin])
+        } else {
+            let path = path(for: a, headScale: k, map: map)
+            path.lineWidth = a.width * k
+            a.color.setStroke()
+            path.stroke()
         }
     }
 
-    static func renderText(_ text: String, at point: NSPoint, color: NSColor, fontSize: CGFloat,
-                           onto image: NSImage) -> NSImage? {
+    /// Smallest distance (image points) from `p` to the annotation's outline.
+    static func distance(from p: NSPoint, to a: Annotation) -> CGFloat {
+        if a.tool == .text { return textRect(a).contains(p) ? 0 : .greatestFiniteMagnitude }
+        let flat = path(for: a, headScale: 1) { $0 }.flattened
+        var best = CGFloat.greatestFiniteMagnitude
+        var cur = NSPoint.zero
+        var pts = [NSPoint](repeating: .zero, count: 3)
+        for i in 0..<flat.elementCount {
+            switch flat.element(at: i, associatedPoints: &pts) {
+            case .moveTo: cur = pts[0]
+            case .lineTo:
+                best = min(best, segmentDistance(p, cur, pts[0]))
+                cur = pts[0]
+            default: break
+            }
+        }
+        return best
+    }
+
+    private static func segmentDistance(_ p: NSPoint, _ a: NSPoint, _ b: NSPoint) -> CGFloat {
+        let dx = b.x - a.x, dy = b.y - a.y
+        let len2 = dx * dx + dy * dy
+        let t = len2 == 0 ? 0 : max(0, min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2))
+        return hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy))
+    }
+
+    static func renderAll(_ annotations: [Annotation], onto image: NSImage) -> NSImage? {
         rasterize(image) { ctx, s, _, cg in
             ctx.draw(cg, in: CGRect(origin: .zero, size: s))
             withGraphics(ctx) {
-                let str = NSAttributedString(string: text, attributes: [
-                    .font: NSFont.boldSystemFont(ofSize: fontSize), .foregroundColor: color])
-                let box = str.boundingRect(with: NSSize(width: 100_000, height: 100_000),
-                                           options: [.usesLineFragmentOrigin])
-                str.draw(with: NSRect(x: point.x, y: point.y - box.height, width: box.width + 4, height: box.height),
-                         options: [.usesLineFragmentOrigin])
+                for a in annotations { draw(a, k: 1) { $0 } }
             }
         }
     }
@@ -759,7 +916,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let colorWell = NSColorWell()
     private let widthPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let widthValues: [CGFloat] = [2, 4, 7, 12]
-    private var undoStack: [NSImage] = []
+    private var undoStack: [(image: NSImage?, annotations: [Annotation])] = []
+    private var lastUndoWasStyle = false
     private var edited = false
     private var adjustBase: NSImage?
     private var adjustApplied = false
@@ -915,6 +1073,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         canvas.onEscape = { [weak self] in
             self?.canvas.cropMode = false
             self?.canvas.tool = .none
+            self?.canvas.selected = nil
         }
 
         let toolDefs: [(AnnotationTool, String, String)] = [
@@ -960,10 +1119,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
         }
         canvas.onShape = { [weak self] shape in
-            guard let self, let img = self.currentImage,
-                  let out = ImageEdit.render(shape, color: self.canvas.annotationColor, onto: img) else { return }
-            self.applyEdit(out, keepView: true)
+            guard let self else { return }
+            self.pushUndo()
+            self.canvas.annotations.append(shape)
+            self.canvas.tool = .none
+            self.canvas.selected = self.canvas.annotations.count - 1
         }
+        canvas.onBeginChange = { [weak self] in self?.pushUndo() }
+        canvas.onEditText = { [weak self] i in self?.editText(i) }
+        canvas.onSelectionChange = { [weak self] in self?.syncStyleToSelection() }
         canvas.onText = { [weak self] p in self?.addText(at: p) }
         styleChanged()
 
@@ -1083,24 +1247,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         confirmDiscard() ? .terminateNow : .terminateCancel
     }
 
+    private func pushUndo(style: Bool = false) {
+        if style && lastUndoWasStyle { return }
+        lastUndoWasStyle = style
+        undoStack.append((currentImage, canvas.annotations))
+        edited = true
+        updateTitle()
+    }
+
+    /// `new` replaces the picture and must already include any annotations (they are cleared).
     private func applyEdit(_ new: NSImage, keepView: Bool = false) {
-        if let cur = currentImage { undoStack.append(cur) }
+        pushUndo()
         currentImage = new
         if keepView { canvas.replaceImage(new) } else { canvas.image = new }
-        edited = true
+        canvas.annotations = []
+        canvas.selected = nil
         updateTitle()
         updateInfo()
     }
 
-    /// Make the current view rotation permanent in the working image.
+    /// Burn annotations and view rotation into the working image.
+    private func flatten() {
+        if canvas.quarterTurns != 0 || !canvas.annotations.isEmpty, let r = canvas.rotatedImage { applyEdit(r) }
+    }
+
+    /// Rotation can't be edited around, so bake it (and any annotations) before drawing tools.
     private func bakeRotation() {
-        if canvas.quarterTurns != 0, let r = canvas.rotatedImage { applyEdit(r) }
+        if canvas.quarterTurns != 0 { flatten() }
     }
 
     @objc func undoEdit() {
-        guard let prev = undoStack.popLast() else { NSSound.beep(); return }
-        currentImage = prev
-        canvas.image = prev
+        guard let prev = undoStack.popLast(), let img = prev.image else { NSSound.beep(); return }
+        lastUndoWasStyle = false
+        currentImage = img
+        if canvas.image?.size == img.size { canvas.replaceImage(img) } else { canvas.image = img }
+        canvas.annotations = prev.annotations
+        canvas.selected = nil
         edited = !undoStack.isEmpty
         updateTitle()
         updateInfo()
@@ -1110,7 +1292,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func flipVertical() { flip(horizontal: false) }
 
     private func flip(horizontal: Bool) {
-        bakeRotation()
+        flatten()
         guard let img = currentImage else { return }
         applyEdit(ImageEdit.flip(img, horizontal: horizontal), keepView: true)
     }
@@ -1118,7 +1300,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func cropAction() {
         guard currentImage != nil else { NSSound.beep(); return }
         if !canvas.cropMode {
-            bakeRotation()
+            flatten()
             canvas.cropMode = true
         } else if let r = canvas.cropRectInImage, let img = currentImage, let out = ImageEdit.crop(img, to: r) {
             canvas.cropMode = false
@@ -1139,30 +1321,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc private func styleChanged() {
         canvas.annotationColor = colorWell.color
         canvas.annotationWidth = widthValues[max(0, widthPopup.indexOfSelectedItem)]
+        guard let i = canvas.selected, canvas.annotations.indices.contains(i), let img = currentImage else { return }
+        pushUndo(style: true)
+        let scale = ImageEdit.strokeScale(img.size)
+        canvas.annotations[i].color = canvas.annotationColor
+        canvas.annotations[i].width = canvas.annotationWidth * scale
+        if canvas.annotations[i].tool == .text { canvas.annotations[i].fontSize = canvas.annotationWidth * 6 * scale }
+    }
+
+    /// Show the selected annotation's color / width in the style controls.
+    private func syncStyleToSelection() {
+        lastUndoWasStyle = false
+        guard let i = canvas.selected, canvas.annotations.indices.contains(i), let img = currentImage else { return }
+        let a = canvas.annotations[i]
+        let w = (a.tool == .text ? a.fontSize / 6 : a.width) / ImageEdit.strokeScale(img.size)
+        let nearest = widthValues.indices.min { abs(widthValues[$0] - w) < abs(widthValues[$1] - w) } ?? 1
+        colorWell.color = a.color
+        widthPopup.selectItem(at: nearest)
+        canvas.annotationColor = a.color
+        canvas.annotationWidth = widthValues[nearest]
+    }
+
+    private func promptText(title: String, initial: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(string: initial)
+        field.frame = NSRect(x: 0, y: 0, width: 300, height: 24)
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty else { return nil }
+        return field.stringValue
     }
 
     private func addText(at point: NSPoint) {
-        guard let img = currentImage else { return }
-        let alert = NSAlert()
-        alert.messageText = "Add text"
-        alert.addButton(withTitle: "Add")
-        alert.addButton(withTitle: "Cancel")
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-        alert.accessoryView = field
-        alert.window.initialFirstResponder = field
-        guard alert.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty else { return }
-        let size = canvas.annotationWidth * 6 * ImageEdit.strokeScale(img.size)
-        if let out = ImageEdit.renderText(field.stringValue, at: point, color: canvas.annotationColor,
-                                          fontSize: size, onto: img) {
-            applyEdit(out, keepView: true)
+        guard let img = currentImage, let text = promptText(title: "Add text", initial: "") else {
+            canvas.tool = .none
+            return
         }
+        pushUndo()
+        let scale = ImageEdit.strokeScale(img.size)
+        canvas.annotations.append(Annotation(tool: .text, points: [point], width: canvas.annotationWidth * scale,
+                                             color: canvas.annotationColor, text: text,
+                                             fontSize: canvas.annotationWidth * 6 * scale))
+        canvas.tool = .none
+        canvas.selected = canvas.annotations.count - 1
+    }
+
+    private func editText(_ index: Int) {
+        guard canvas.annotations.indices.contains(index),
+              let text = promptText(title: "Edit text", initial: canvas.annotations[index].text),
+              text != canvas.annotations[index].text else { return }
+        pushUndo()
+        canvas.annotations[index].text = text
     }
 
     @objc func showAdjust() {
         guard currentImage != nil else { NSSound.beep(); return }
         canvas.cropMode = false
         canvas.tool = .none
-        bakeRotation()
+        flatten()
         guard let base = currentImage else { return }
         adjustBase = base
         adjustApplied = false

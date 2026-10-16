@@ -7,7 +7,7 @@ A small native macOS picture viewer (Swift / AppKit).
 - Fit / actual size / zoom / pan
 - Rotate left/right (⌘[ / ⌘]), copy to clipboard (⌘C), rename (⌘E), drag & drop to open
 - Icon toolbar (top right) for rotate, zoom, fit, slideshow, info, thumbnails, copy, rename, trash
-- Annotate: line, arrow, rectangle, circle, freehand pen, text (color + width)
+- Annotate: line, arrow, rectangle, circle, freehand pen, text — click to select, drag to move, drag end points to resize, double-click text to edit, Delete to remove, change color/width of the selection
 - Simple editing: crop, flip, brightness / contrast / saturation, undo, save or save a copy
 - Info panel with file / EXIF details (I), thumbnail strip (T), slideshow (Space)
 - Printing with live preview, paper & orientation selection, shrink-to-fit, fit, actual size, fill, centering
