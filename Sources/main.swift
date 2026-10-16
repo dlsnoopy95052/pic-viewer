@@ -37,7 +37,32 @@ enum Formats {
 
 final class ImageCanvas: NSView {
     var image: NSImage? {
-        didSet { zoom = nil; offset = .zero; needsDisplay = true }
+        didSet { zoom = nil; offset = .zero; quarterTurns = 0; needsDisplay = true }
+    }
+    /// Clockwise quarter turns applied to the view of the image (not to the file).
+    private(set) var quarterTurns = 0
+    var onDrop: ((URL) -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        registerForDraggedTypes([.fileURL])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func rotate(by turns: Int) {
+        quarterTurns = ((quarterTurns + turns) % 4 + 4) % 4
+        offset = .zero
+        needsDisplay = true
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = sender.draggingPasteboard.readObjects(
+            forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]
+        guard let url = urls?.first else { return false }
+        onDrop?(url)
+        return true
     }
     /// nil means "fit to window".
     private(set) var zoom: CGFloat?
@@ -46,7 +71,8 @@ final class ImageCanvas: NSView {
     override var acceptsFirstResponder: Bool { true }
 
     private var fitScale: CGFloat {
-        guard let s = image?.size, s.width > 0, s.height > 0 else { return 1 }
+        guard let raw = image?.size, raw.width > 0, raw.height > 0 else { return 1 }
+        let s = quarterTurns % 2 == 1 ? NSSize(width: raw.height, height: raw.width) : raw
         return min(1, bounds.width / s.width, bounds.height / s.height)
     }
 
@@ -56,12 +82,15 @@ final class ImageCanvas: NSView {
         guard let image else { return }
         let scale = zoom ?? fitScale
         let size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
-        let rect = NSRect(x: bounds.midX - size.width / 2 + offset.x,
-                          y: bounds.midY - size.height / 2 + offset.y,
-                          width: size.width, height: size.height)
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.saveGState()
+        ctx.translateBy(x: bounds.midX + offset.x, y: bounds.midY + offset.y)
+        ctx.rotate(by: -CGFloat(quarterTurns) * .pi / 2)
+        let rect = NSRect(x: -size.width / 2, y: -size.height / 2, width: size.width, height: size.height)
         image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1,
                    respectFlipped: true,
                    hints: [.interpolation: NSImageInterpolation.high.rawValue])
+        ctx.restoreGState()
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -70,6 +99,22 @@ final class ImageCanvas: NSView {
     }
 
     func fit() { zoom = nil; offset = .zero; needsDisplay = true }
+
+    /// The image with the current rotation baked in (for printing / copying).
+    var rotatedImage: NSImage? {
+        guard let image else { return nil }
+        let t = quarterTurns
+        if t == 0 { return image }
+        let s = image.size
+        let out = t % 2 == 1 ? NSSize(width: s.height, height: s.width) : s
+        return NSImage(size: out, flipped: false) { rect in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            ctx.translateBy(x: rect.midX, y: rect.midY)
+            ctx.rotate(by: -CGFloat(t) * .pi / 2)
+            image.draw(in: NSRect(x: -s.width / 2, y: -s.height / 2, width: s.width, height: s.height))
+            return true
+        }
+    }
     func actualSize() { zoom = 1; offset = .zero; needsDisplay = true }
 
     func zoomBy(_ factor: CGFloat) {
@@ -101,6 +146,132 @@ final class ImageCanvas: NSView {
         if event.clickCount == 2 {
             if zoom == nil { actualSize() } else { fit() }
         }
+    }
+}
+
+// MARK: - Thumbnail strip
+
+final class ThumbCell: NSView {
+    var image: NSImage? { didSet { needsDisplay = true } }
+    var isCurrent = false { didSet { needsDisplay = true } }
+    var onClick: (() -> Void)?
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 84, height: 64) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let box = bounds.insetBy(dx: 3, dy: 3)
+        NSColor(white: 0.2, alpha: 1).setFill()
+        box.fill()
+        if let image {
+            let s = image.size
+            let k = min(box.width / s.width, box.height / s.height)
+            let r = NSRect(x: box.midX - s.width * k / 2, y: box.midY - s.height * k / 2,
+                           width: s.width * k, height: s.height * k)
+            image.draw(in: r)
+        }
+        if isCurrent {
+            NSColor.controlAccentColor.setStroke()
+            let p = NSBezierPath(rect: box.insetBy(dx: 1, dy: 1))
+            p.lineWidth = 3
+            p.stroke()
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) { onClick?() }
+}
+
+final class ThumbnailStrip: NSScrollView {
+    var onSelect: ((Int) -> Void)?
+    private let stack = NSStackView()
+    private var cells: [ThumbCell] = []
+    private var generation = 0
+    private var current = -1
+    private static let queue = DispatchQueue(label: "thumbnails", qos: .utility, attributes: .concurrent)
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        hasHorizontalScroller = true
+        hasVerticalScroller = false
+        drawsBackground = true
+        backgroundColor = NSColor(white: 0.07, alpha: 1)
+        stack.orientation = .horizontal
+        stack.spacing = 0
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 0, right: 4)
+        documentView = stack
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func load(_ urls: [URL], selected: Int) {
+        generation += 1
+        let gen = generation
+        cells.forEach { $0.removeFromSuperview() }
+        cells = urls.enumerated().map { i, _ in
+            let c = ThumbCell()
+            c.onClick = { [weak self] in self?.onSelect?(i) }
+            stack.addArrangedSubview(c)
+            return c
+        }
+        stack.frame.size = NSSize(width: CGFloat(cells.count) * 84 + 8, height: 64)
+        select(selected)
+        for (i, url) in urls.enumerated() {
+            Self.queue.async { [weak self] in
+                guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+                      let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                        kCGImageSourceThumbnailMaxPixelSize: 160] as CFDictionary)
+                else { return }
+                let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+                DispatchQueue.main.async {
+                    guard let self, self.generation == gen, self.cells.indices.contains(i) else { return }
+                    self.cells[i].image = img
+                }
+            }
+        }
+    }
+
+    func select(_ i: Int) {
+        if cells.indices.contains(current) { cells[current].isCurrent = false }
+        current = i
+        guard cells.indices.contains(i) else { return }
+        cells[i].isCurrent = true
+        cells[i].scrollToVisible(cells[i].bounds.insetBy(dx: -80, dy: 0))
+    }
+}
+
+// MARK: - Image metadata
+
+enum ImageInfo {
+    static func lines(for url: URL, pixelSize: (Int, Int)?) -> [String] {
+        var out = [url.lastPathComponent]
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        if let bytes = attrs?[.size] as? Int64 {
+            out.append("Size: " + ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))
+        }
+        if let (w, h) = pixelSize { out.append("Dimensions: \(w) × \(h) px") }
+        if let date = attrs?[.modificationDate] as? Date {
+            out.append("Modified: " + date.formatted(date: .abbreviated, time: .shortened))
+        }
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else { return out }
+        let tiff = p[kCGImagePropertyTIFFDictionary] as? [CFString: Any] ?? [:]
+        let exif = p[kCGImagePropertyExifDictionary] as? [CFString: Any] ?? [:]
+        let camera = [tiff[kCGImagePropertyTIFFMake], tiff[kCGImagePropertyTIFFModel]]
+            .compactMap { $0 as? String }.joined(separator: " ")
+        if !camera.isEmpty { out.append("Camera: " + camera) }
+        if let lens = exif[kCGImagePropertyExifLensModel] as? String { out.append("Lens: " + lens) }
+        var shot: [String] = []
+        if let f = (exif[kCGImagePropertyExifFNumber] as? NSNumber)?.doubleValue { shot.append(String(format: "ƒ/%.1f", f)) }
+        if let t = (exif[kCGImagePropertyExifExposureTime] as? NSNumber)?.doubleValue, t > 0 {
+            shot.append(t < 1 ? "1/\(Int((1 / t).rounded())) s" : String(format: "%.1f s", t))
+        }
+        if let iso = (exif[kCGImagePropertyExifISOSpeedRatings] as? [NSNumber])?.first { shot.append("ISO \(iso)") }
+        if let fl = (exif[kCGImagePropertyExifFocalLength] as? NSNumber)?.doubleValue {
+            shot.append(String(format: "%.0f mm", fl))
+        }
+        if !shot.isEmpty { out.append(shot.joined(separator: "  ")) }
+        if let d = exif[kCGImagePropertyExifDateTimeOriginal] as? String { out.append("Taken: " + d) }
+        return out
     }
 }
 
@@ -249,6 +420,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var index = 0
     private var currentImage: NSImage?
 
+    private let strip = ThumbnailStrip()
+    private var stripHeight: NSLayoutConstraint!
+    private let infoBox = NSStackView()
+    private let infoLabel = NSTextField(labelWithString: "")
+    private var slideshowTimer: Timer?
+    private var showStrip = false
+    private var showInfo = false
+    private let toolbar = NSStackView()
+    private var slideshowButton: NSButton!
+    private var infoButton: NSButton!
+    private var thumbsButton: NSButton!
+
     // MARK: Launch
 
     private var didSetUp = false
@@ -294,19 +477,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         let content = NSView()
         canvas.translatesAutoresizingMaskIntoConstraints = false
+        canvas.onDrop = { [weak self] url in self?.open(url) }
+        strip.translatesAutoresizingMaskIntoConstraints = false
+        strip.isHidden = true
+        strip.onSelect = { [weak self] i in
+            guard let self, self.files.indices.contains(i) else { return }
+            self.index = i; self.show()
+        }
         content.addSubview(canvas)
+        content.addSubview(strip)
+        stripHeight = strip.heightAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
             canvas.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             canvas.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             canvas.topAnchor.constraint(equalTo: content.topAnchor),
-            canvas.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            canvas.bottomAnchor.constraint(equalTo: strip.topAnchor),
+            strip.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            strip.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            strip.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            stripHeight,
         ])
+
+        infoLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        infoLabel.textColor = .white
+        infoBox.addArrangedSubview(infoLabel)
+        infoBox.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
+        infoBox.wantsLayer = true
+        infoBox.layer?.backgroundColor = NSColor(white: 0, alpha: 0.7).cgColor
+        infoBox.layer?.cornerRadius = 8
+        infoBox.isHidden = true
+        infoBox.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(infoBox)
+        infoBox.topAnchor.constraint(equalTo: content.topAnchor, constant: 12).isActive = true
+        infoBox.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12).isActive = true
+
+        func tool(_ symbol: String, _ tip: String, _ action: Selector) -> NSButton {
+            let b = NSButton()
+            b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)?
+                .withSymbolConfiguration(.init(pointSize: 15, weight: .regular))
+            b.isBordered = false
+            b.imagePosition = .imageOnly
+            b.contentTintColor = NSColor(white: 1, alpha: 0.85)
+            b.toolTip = tip
+            b.target = self
+            b.action = action
+            b.focusRingType = .none
+            b.widthAnchor.constraint(equalToConstant: 28).isActive = true
+            b.heightAnchor.constraint(equalToConstant: 28).isActive = true
+            return b
+        }
+        slideshowButton = tool("play.fill", "Start slideshow (Space)", #selector(toggleSlideshow))
+        infoButton = tool("info.circle", "Show info (I)", #selector(toggleInfo))
+        thumbsButton = tool("square.grid.3x1.below.line.grid.1x2", "Show thumbnails (T)", #selector(toggleThumbnails))
+        toolbar.setViews([
+            tool("rotate.left", "Rotate left (⌘[)", #selector(rotateLeft)),
+            tool("rotate.right", "Rotate right (⌘])", #selector(rotateRight)),
+            tool("minus.magnifyingglass", "Zoom out (⌘-)", #selector(zoomOut)),
+            tool("plus.magnifyingglass", "Zoom in (⌘+)", #selector(zoomIn)),
+            tool("arrow.up.left.and.down.right.magnifyingglass", "Fit to window (⌘0)", #selector(fitToWindow)),
+            slideshowButton, infoButton, thumbsButton,
+            tool("doc.on.doc", "Copy image (⌘C)", #selector(copyImage)),
+            tool("pencil", "Rename (⌘E)", #selector(renameFile)),
+            tool("trash", "Move to Trash (⌘⌫)", #selector(moveToTrash)),
+        ], in: .leading)
+        toolbar.spacing = 2
+        toolbar.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
+        toolbar.wantsLayer = true
+        toolbar.layer?.backgroundColor = NSColor(white: 0, alpha: 0.6).cgColor
+        toolbar.layer?.cornerRadius = 10
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(toolbar)
+        toolbar.topAnchor.constraint(equalTo: content.topAnchor, constant: 12).isActive = true
+        toolbar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12).isActive = true
 
         configure(prevButton, symbol: "chevron.left.circle.fill", action: #selector(previous))
         configure(nextButton, symbol: "chevron.right.circle.fill", action: #selector(next))
         for b in [prevButton, nextButton] {
             content.addSubview(b)
-            b.centerYAnchor.constraint(equalTo: content.centerYAnchor).isActive = true
+            b.centerYAnchor.constraint(equalTo: canvas.centerYAnchor).isActive = true
         }
         prevButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14).isActive = true
         nextButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14).isActive = true
@@ -357,7 +605,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         files = Formats.imagesInFolder(of: url)
         if !files.contains(url) { files.append(url) }
         index = files.firstIndex(of: url) ?? 0
+        reloadStrip()
         show()
+    }
+
+    private func reloadStrip() {
+        if showStrip { strip.load(files, selected: index) }
     }
 
     private func show() {
@@ -379,6 +632,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         nextButton.isEnabled = index < files.count - 1
         prevButton.alphaValue = prevButton.isEnabled ? 1 : 0.25
         nextButton.alphaValue = nextButton.isEnabled ? 1 : 0.25
+        strip.select(index)
+        updateInfo()
+    }
+
+    private func updateInfo() {
+        guard showInfo, files.indices.contains(index) else { return }
+        let rep = currentImage?.representations.first
+        let px = rep.flatMap { $0.pixelsWide > 0 && $0.pixelsHigh > 0 ? ($0.pixelsWide, $0.pixelsHigh) : nil }
+        infoLabel.stringValue = ImageInfo.lines(for: files[index], pixelSize: px).joined(separator: "\n")
+    }
+
+    // MARK: Rotate / slideshow / panels / rename / copy
+
+    @objc func showAbout() {
+        let built = Bundle.main.object(forInfoDictionaryKey: "PVBuildDate") as? String ?? "unknown"
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationName: "Picture Viewer",
+            .applicationVersion: "Built \(built)",
+            .version: "",
+        ])
+    }
+
+    @objc func rotateLeft() { canvas.rotate(by: -1) }
+    @objc func rotateRight() { canvas.rotate(by: 1) }
+
+    @objc func toggleInfo() {
+        showInfo.toggle()
+        infoBox.isHidden = !showInfo
+        infoButton.contentTintColor = showInfo ? .controlAccentColor : NSColor(white: 1, alpha: 0.85)
+        updateInfo()
+    }
+
+    @objc func toggleThumbnails() {
+        showStrip.toggle()
+        strip.isHidden = !showStrip
+        stripHeight.constant = showStrip ? 72 : 0
+        thumbsButton.contentTintColor = showStrip ? .controlAccentColor : NSColor(white: 1, alpha: 0.85)
+        if showStrip { strip.load(files, selected: index) }
+    }
+
+    @objc func toggleSlideshow() {
+        if let t = slideshowTimer {
+            t.invalidate(); slideshowTimer = nil
+            slideshowButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 15, weight: .regular))
+            slideshowButton.toolTip = "Start slideshow (Space)"
+        } else {
+            guard files.count > 1 else { NSSound.beep(); return }
+            slideshowTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.index = (self.index + 1) % self.files.count
+                self.show()
+            }
+            slideshowButton.image = NSImage(systemSymbolName: "pause.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 15, weight: .regular))
+            slideshowButton.toolTip = "Stop slideshow (Space)"
+        }
+    }
+
+    @objc func copyImage() {
+        guard let image = canvas.rotatedImage else { NSSound.beep(); return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([image])
+    }
+
+    @objc func renameFile() {
+        guard files.indices.contains(index) else { return }
+        let url = files[index]
+        let alert = NSAlert()
+        alert.messageText = "Rename"
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(string: url.lastPathComponent)
+        field.frame = NSRect(x: 0, y: 0, width: 300, height: 24)
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, name != url.lastPathComponent, !name.contains("/") else { return }
+        let dest = url.deletingLastPathComponent().appendingPathComponent(name)
+        do {
+            try FileManager.default.moveItem(at: url, to: dest)
+            files[index] = dest
+            reloadStrip()
+            show()
+        } catch {
+            NSAlert(error: error).runModal()
+        }
     }
 
     @objc func previous() { if index > 0 { index -= 1; show() } }
@@ -406,6 +747,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 prevButton.isEnabled = false; nextButton.isEnabled = false
             } else {
                 index = min(index, files.count - 1)
+                reloadStrip()
                 show()
             }
         }
@@ -418,7 +760,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc func printImage() {
-        guard let image = currentImage else { NSSound.beep(); return }
+        guard let image = canvas.rotatedImage else { NSSound.beep(); return }
         // Pick the orientation that suits the picture; the user can still change it in the panel.
         printInfo.orientation = image.size.width > image.size.height ? .landscape : .portrait
 
@@ -438,9 +780,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         switch item.action {
         case #selector(previous): return index > 0
         case #selector(next): return index < files.count - 1
+        case #selector(toggleSlideshow):
+            item.title = slideshowTimer == nil ? "Start Slideshow" : "Stop Slideshow"
+            return files.count > 1
+        case #selector(toggleInfo):
+            item.state = showInfo ? .on : .off
+            return true
+        case #selector(toggleThumbnails):
+            item.state = showStrip ? .on : .off
+            return true
+        case #selector(renameFile), #selector(moveToTrash), #selector(revealInFinder):
+            return !files.isEmpty
         case #selector(printImage), #selector(fitToWindow), #selector(actualSize),
-             #selector(zoomIn), #selector(zoomOut), #selector(moveToTrash), #selector(revealInFinder):
-            return currentImage != nil || item.action == #selector(moveToTrash) && !files.isEmpty
+             #selector(zoomIn), #selector(zoomOut), #selector(rotateLeft), #selector(rotateRight),
+             #selector(copyImage):
+            return currentImage != nil
         default: return true
         }
     }
@@ -468,6 +822,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let arrow = { (c: Int) in String(UnicodeScalar(c)!) }
 
         let app = submenu("Picture Viewer")
+        add(app, "About Picture Viewer", #selector(showAbout))
+        app.addItem(.separator())
         add(app, "Hide Picture Viewer", #selector(NSApplication.hide(_:)), "h")
         app.addItem(.separator())
         add(app, "Quit Picture Viewer", #selector(NSApplication.terminate(_:)), "q")
@@ -478,10 +834,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         add(file, "Page Setup…", #selector(pageSetup), "p", [.command, .shift])
         add(file, "Print…", #selector(printImage), "p")
         file.addItem(.separator())
+        add(file, "Rename…", #selector(renameFile), "e")
         add(file, "Show in Finder", #selector(revealInFinder), "r")
         add(file, "Move to Trash", #selector(moveToTrash), "\u{8}")
         file.addItem(.separator())
         add(file, "Close", #selector(NSWindow.performClose(_:)), "w")
+
+        let edit = submenu("Edit")
+        add(edit, "Copy", #selector(copyImage), "c")
 
         let view = submenu("View")
         add(view, "Previous Picture", #selector(previous), arrow(NSLeftArrowFunctionKey), [])
@@ -493,6 +853,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         add(view, "Actual Size", #selector(actualSize), "1")
         add(view, "Zoom In", #selector(zoomIn), "+")
         add(view, "Zoom Out", #selector(zoomOut), "-")
+        view.addItem(.separator())
+        add(view, "Rotate Left", #selector(rotateLeft), "[")
+        add(view, "Rotate Right", #selector(rotateRight), "]")
+        view.addItem(.separator())
+        add(view, "Show Info", #selector(toggleInfo), "i")
+        add(view, "Show Thumbnails", #selector(toggleThumbnails), "t")
+        add(view, "Start Slideshow", #selector(toggleSlideshow), " ", [])
         view.addItem(.separator())
         add(view, "Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control])
 

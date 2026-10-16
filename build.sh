@@ -62,6 +62,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+/usr/libexec/PlistBuddy -c "Add :PVBuildDate string $(date '+%Y-%m-%d %H:%M:%S')" "$APP/Contents/Info.plist"
+
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 echo "Built: $(pwd)/$APP"
 
