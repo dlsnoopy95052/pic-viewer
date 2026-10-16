@@ -92,7 +92,7 @@ final class ImageCanvas: NSView {
     /// Called once, right before an interactive change mutates `annotations` (push undo here).
     var onBeginChange: (() -> Void)?
     var onEditText: ((Int) -> Void)?
-    private enum Drag { case none, move(NSPoint), handle(Int) }
+    private enum Drag { case none, move(NSPoint), handle(Int), rotate }
     private var drag = Drag.none
     private var dragStarted = false
 
@@ -107,8 +107,28 @@ final class ImageCanvas: NSView {
 
     private func handleIndex(at p: NSPoint) -> Int? {
         guard let i = selected, annotations.indices.contains(i), annotations[i].tool.hasHandles else { return nil }
+        let a = annotations[i]
         let tol = 9 / max(zoom ?? fitScale, 0.0001)
-        return annotations[i].points.firstIndex { hypot($0.x - p.x, $0.y - p.y) <= tol }
+        let c = ImageEdit.center(of: a)
+        return a.points.firstIndex {
+            let w = ImageEdit.rotated($0, about: c, by: a.angle)
+            return hypot(w.x - p.x, w.y - p.y) <= tol
+        }
+    }
+
+    /// Where the selected annotation's rotation knob sits, in image points.
+    private func rotationKnob(for a: Annotation) -> NSPoint {
+        let k = max(zoom ?? fitScale, 0.0001)
+        let b = ImageEdit.bounds(of: a)
+        let c = ImageEdit.center(of: a)
+        return ImageEdit.rotated(NSPoint(x: c.x, y: b.maxY + 26 / k), about: c, by: a.angle)
+    }
+
+    private func isOnRotationKnob(_ p: NSPoint) -> Bool {
+        guard let i = selected, annotations.indices.contains(i), annotations[i].tool.canRotate else { return false }
+        let k = max(zoom ?? fitScale, 0.0001)
+        let q = rotationKnob(for: annotations[i])
+        return hypot(q.x - p.x, q.y - p.y) <= 9 / k
     }
 
     private func toImage(_ p: NSPoint) -> NSPoint {
@@ -216,11 +236,24 @@ final class ImageCanvas: NSView {
             let b = ImageEdit.bounds(of: a)
             let vr = NSRect(origin: v(b.origin), size: NSSize(width: b.width * scale, height: b.height * scale))
                 .insetBy(dx: -4, dy: -4)
+            NSGraphicsContext.saveGraphicsState()
+            if a.angle != 0 { ImageEdit.concatRotation(a.angle, about: v(ImageEdit.center(of: a))) }
             let box = NSBezierPath(rect: vr)
             box.lineWidth = 1
             box.setLineDash([4, 3], count: 2, phase: 0)
             NSColor.controlAccentColor.setStroke()
             box.stroke()
+            if a.tool.canRotate {
+                let top = NSPoint(x: vr.midX, y: vr.maxY)
+                let knob = NSPoint(x: vr.midX, y: vr.maxY + 22)
+                let stem = NSBezierPath()
+                stem.move(to: top); stem.line(to: knob)
+                stem.lineWidth = 1
+                stem.stroke()
+                let dot = NSBezierPath(ovalIn: NSRect(x: knob.x - 5, y: knob.y - 5, width: 10, height: 10))
+                NSColor.white.setFill(); dot.fill()
+                NSColor.controlAccentColor.setStroke(); dot.lineWidth = 1.5; dot.stroke()
+            }
             if a.tool.hasHandles {
                 for q in a.points {
                     let c = v(q)
@@ -229,6 +262,7 @@ final class ImageCanvas: NSView {
                     NSColor.controlAccentColor.setStroke(); h.lineWidth = 1.5; h.stroke()
                 }
             }
+            NSGraphicsContext.restoreGraphicsState()
         }
 
         if cropMode {
@@ -333,7 +367,25 @@ final class ImageCanvas: NSView {
                 return
             case .handle(let h):
                 if !dragStarted { onBeginChange?(); dragStarted = true }
-                annotations[i].points[h] = p
+                var a = annotations[i]
+                guard a.points.count == 2 else { return }
+                // Keep the opposite corner fixed in the picture, even when rotated.
+                let j = 1 - h
+                let opp = ImageEdit.rotated(a.points[j], about: ImageEdit.center(of: a), by: a.angle)
+                let c = NSPoint(x: (p.x + opp.x) / 2, y: (p.y + opp.y) / 2)
+                a.points[h] = ImageEdit.rotated(p, about: c, by: -a.angle)
+                a.points[j] = ImageEdit.rotated(opp, about: c, by: -a.angle)
+                annotations[i] = a
+                return
+            case .rotate:
+                if !dragStarted { onBeginChange?(); dragStarted = true }
+                let c = ImageEdit.center(of: annotations[i])
+                var angle = atan2(p.y - c.y, p.x - c.x) - .pi / 2
+                if event.modifierFlags.contains(.shift) {
+                    let step = CGFloat.pi / 12
+                    angle = (angle / step).rounded() * step
+                }
+                annotations[i].angle = angle
                 return
             case .none: break
             }
@@ -366,6 +418,10 @@ final class ImageCanvas: NSView {
         }
         if image != nil, quarterTurns == 0, !annotations.isEmpty {
             let p = toImage(convert(event.locationInWindow, from: nil))
+            if isOnRotationKnob(p) {
+                drag = .rotate
+                return
+            }
             if let h = handleIndex(at: p) {
                 drag = .handle(h)
                 return
@@ -520,6 +576,9 @@ enum AnnotationTool: Int {
 
     /// Two-point shapes whose end points can be dragged.
     var hasHandles: Bool { [.line, .arrow, .rect, .ellipse].contains(self) }
+
+    /// Shapes that get a rotation knob (lines and arrows already point anywhere via their end points).
+    var canRotate: Bool { [.rect, .ellipse, .text].contains(self) }
 }
 
 /// A mark drawn over the picture. Points are in image points, origin bottom-left.
@@ -531,6 +590,8 @@ struct Annotation {
     var color: NSColor
     var text = ""
     var fontSize: CGFloat = 0
+    /// Radians, counter-clockwise, about the annotation's center (rect / ellipse / text only).
+    var angle: CGFloat = 0
 }
 
 enum ImageEdit {
@@ -620,8 +681,30 @@ enum ImageEdit {
         return NSRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0).insetBy(dx: -a.width / 2, dy: -a.width / 2)
     }
 
+    static func center(of a: Annotation) -> NSPoint {
+        let r = bounds(of: a)
+        return NSPoint(x: r.midX, y: r.midY)
+    }
+
+    static func rotated(_ p: NSPoint, about c: NSPoint, by angle: CGFloat) -> NSPoint {
+        let dx = p.x - c.x, dy = p.y - c.y
+        return NSPoint(x: c.x + dx * cos(angle) - dy * sin(angle), y: c.y + dx * sin(angle) + dy * cos(angle))
+    }
+
+    /// Rotates subsequent drawing about `c` in the current graphics context.
+    static func concatRotation(_ angle: CGFloat, about c: NSPoint) {
+        let t = NSAffineTransform()
+        t.translateX(by: c.x, yBy: c.y)
+        t.rotate(byRadians: angle)
+        t.translateX(by: -c.x, yBy: -c.y)
+        t.concat()
+    }
+
     /// Draws into the current graphics context. `k` converts image points to drawing units.
     static func draw(_ a: Annotation, k: CGFloat, map: (NSPoint) -> NSPoint) {
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        if a.angle != 0 { concatRotation(a.angle, about: map(center(of: a))) }
         if a.tool == .text {
             guard let p = a.points.first else { return }
             let o = map(p)
@@ -639,7 +722,8 @@ enum ImageEdit {
     }
 
     /// Smallest distance (image points) from `p` to the annotation's outline.
-    static func distance(from p: NSPoint, to a: Annotation) -> CGFloat {
+    static func distance(from point: NSPoint, to a: Annotation) -> CGFloat {
+        let p = a.angle == 0 ? point : rotated(point, about: center(of: a), by: -a.angle)
         if a.tool == .text { return textRect(a).contains(p) ? 0 : .greatestFiniteMagnitude }
         let flat = path(for: a, headScale: 1) { $0 }.flattened
         var best = CGFloat.greatestFiniteMagnitude
