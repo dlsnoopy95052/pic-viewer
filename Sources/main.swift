@@ -807,7 +807,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         window.title = "Picture Viewer"
-        window.minSize = NSSize(width: 360, height: 280)
+        window.minSize = NSSize(width: 960, height: 280)
         window.delegate = self
         window.center()
         window.setFrameAutosaveName("MainWindow")
@@ -845,7 +845,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         infoBox.isHidden = true
         infoBox.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(infoBox)
-        infoBox.topAnchor.constraint(equalTo: content.topAnchor, constant: 12).isActive = true
+        infoBox.topAnchor.constraint(equalTo: content.topAnchor, constant: 56).isActive = true
         infoBox.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12).isActive = true
 
         func tool(_ symbol: String, _ tip: String, _ action: Selector) -> NSButton {
@@ -905,8 +905,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         editBar.layer?.cornerRadius = 10
         editBar.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(editBar)
-        editBar.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 6).isActive = true
-        editBar.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor).isActive = true
+        editBar.topAnchor.constraint(equalTo: toolbar.topAnchor).isActive = true
+        editBar.trailingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: -8).isActive = true
         canvas.onCropModeChange = { [weak self] in
             guard let self else { return }
             self.cropButton.contentTintColor = self.canvas.cropMode
@@ -951,8 +951,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         annotBar.layer?.cornerRadius = 10
         annotBar.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(annotBar)
-        annotBar.topAnchor.constraint(equalTo: editBar.bottomAnchor, constant: 6).isActive = true
-        annotBar.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor).isActive = true
+        annotBar.topAnchor.constraint(equalTo: toolbar.topAnchor).isActive = true
+        annotBar.trailingAnchor.constraint(equalTo: editBar.leadingAnchor, constant: -8).isActive = true
         canvas.onToolChange = { [weak self] in
             guard let self else { return }
             for (t, b) in self.toolButtons {
