@@ -64,7 +64,15 @@ PLIST
 
 /usr/libexec/PlistBuddy -c "Add :PVBuildDate string $(date '+%Y-%m-%d %H:%M:%S')" "$APP/Contents/Info.plist"
 
-codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+# Prefer a stable local identity so macOS keeps privacy grants (e.g. Screen Recording) across rebuilds.
+# Create one in Keychain Access > Certificate Assistant > Create a Certificate (type: Code Signing).
+IDENTITY="PictureViewer Local Signing"
+if security find-identity -p codesigning 2>/dev/null | grep -q "$IDENTITY"; then
+  codesign --force --sign "$IDENTITY" "$APP" && echo "Signed with: $IDENTITY"
+else
+  codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+  echo "Ad-hoc signed (privacy permissions may reset on every rebuild)"
+fi
 echo "Built: $(pwd)/$APP"
 
 if [ "${1:-}" = "--install" ]; then

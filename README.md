@@ -5,7 +5,6 @@ A small native macOS picture viewer (Swift / AppKit).
 - Opens JPEG, PNG, GIF, TIFF, BMP, HEIC, WebP, AVIF, ICO, PSD, SVG, PDF and common RAW formats
 - Browse every picture in the same folder with on-screen arrows or ← / →
 - Fit / actual size / zoom / pan
-- Capture a screen area (camera icon, or ⌥⌘4 from anywhere), auto-copied to the clipboard, then annotate and save it
 - Mosaic tool to hide sensitive areas
 - Rotate left/right (⌘[ / ⌘]), copy to clipboard (⌘C), rename (⌘E), drag & drop to open
 - Icon toolbar (top right) for rotate, zoom, fit, slideshow, info, thumbnails, copy, rename, trash
