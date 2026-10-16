@@ -1,4 +1,5 @@
 import Cocoa
+import CoreImage
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -37,7 +38,77 @@ enum Formats {
 
 final class ImageCanvas: NSView {
     var image: NSImage? {
-        didSet { zoom = nil; offset = .zero; quarterTurns = 0; needsDisplay = true }
+        didSet {
+            if !preserveView { zoom = nil; offset = .zero; quarterTurns = 0; cropRect = nil; drawPoints = [] }
+            needsDisplay = true
+        }
+    }
+    private var preserveView = false
+    /// Swap the picture without touching zoom / pan / rotation (live adjustment preview).
+    func replaceImage(_ new: NSImage) {
+        preserveView = true; image = new; preserveView = false
+    }
+
+    // Crop selection (view coordinates). Only meaningful while quarterTurns == 0.
+    var cropMode = false {
+        didSet {
+            cropRect = nil; cropStart = nil; needsDisplay = true
+            if cropMode { tool = .none }
+            window?.invalidateCursorRects(for: self)
+            onCropModeChange?()
+        }
+    }
+    private(set) var cropRect: NSRect?
+    private var cropStart: NSPoint?
+    var onCropModeChange: (() -> Void)?
+    var onEscape: (() -> Void)?
+
+    // Annotation drawing (points are in image points, origin bottom-left).
+    var tool: AnnotationTool = .none {
+        didSet {
+            if tool != .none { cropMode = false }
+            drawPoints = []
+            needsDisplay = true
+            window?.invalidateCursorRects(for: self)
+            onToolChange?()
+        }
+    }
+    var annotationColor = NSColor.systemRed
+    var annotationWidth: CGFloat = 4
+    private var drawPoints: [NSPoint] = []
+    var onShape: ((AnnotationShape) -> Void)?
+    var onText: ((NSPoint) -> Void)?
+    var onToolChange: (() -> Void)?
+
+    private func toImage(_ p: NSPoint) -> NSPoint {
+        let ir = imageRect, s = image?.size ?? .zero
+        guard ir.width > 0, ir.height > 0 else { return .zero }
+        return NSPoint(x: (p.x - ir.minX) / ir.width * s.width, y: (p.y - ir.minY) / ir.height * s.height)
+    }
+
+    override func resetCursorRects() {
+        if tool != .none || cropMode { addCursorRect(bounds, cursor: .crosshair) }
+    }
+
+    private var imageRect: NSRect {
+        guard let image else { return .zero }
+        let k = zoom ?? fitScale
+        let w = image.size.width * k, h = image.size.height * k
+        return NSRect(x: bounds.midX - w / 2 + offset.x, y: bounds.midY - h / 2 + offset.y, width: w, height: h)
+    }
+
+    /// The selection in image points (origin bottom-left), or nil.
+    var cropRectInImage: NSRect? {
+        guard let image, let r = cropRect, r.width > 2, r.height > 2 else { return nil }
+        let ir = imageRect
+        guard ir.width > 0, ir.height > 0 else { return nil }
+        let kx = image.size.width / ir.width, ky = image.size.height / ir.height
+        return NSRect(x: (r.minX - ir.minX) * kx, y: (r.minY - ir.minY) * ky,
+                      width: r.width * kx, height: r.height * ky)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { onEscape?() } else { super.keyDown(with: event) }
     }
     /// Clockwise quarter turns applied to the view of the image (not to the file).
     private(set) var quarterTurns = 0
@@ -50,6 +121,8 @@ final class ImageCanvas: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     func rotate(by turns: Int) {
+        cropMode = false
+        tool = .none
         quarterTurns = ((quarterTurns + turns) % 4 + 4) % 4
         offset = .zero
         needsDisplay = true
@@ -91,6 +164,34 @@ final class ImageCanvas: NSView {
                    respectFlipped: true,
                    hints: [.interpolation: NSImageInterpolation.high.rawValue])
         ctx.restoreGState()
+
+        if cropMode {
+            let path = NSBezierPath(rect: bounds)
+            if let r = cropRect { path.append(NSBezierPath(rect: r)) }
+            path.windingRule = .evenOdd
+            NSColor(white: 0, alpha: 0.5).setFill()
+            path.fill()
+            if let r = cropRect {
+                NSColor.white.setStroke()
+                let b = NSBezierPath(rect: r)
+                b.lineWidth = 1
+                b.setLineDash([5, 3], count: 2, phase: 0)
+                b.stroke()
+            }
+        }
+
+        if tool != .none, drawPoints.count >= 2 {
+            let ir = imageRect
+            let k = ir.width / image.size.width
+            let shape = AnnotationShape(tool: tool, points: drawPoints,
+                                        width: annotationWidth * ImageEdit.strokeScale(image.size))
+            let path = ImageEdit.path(for: shape, headScale: k) {
+                NSPoint(x: ir.minX + $0.x * k, y: ir.minY + $0.y * k)
+            }
+            path.lineWidth = shape.width * k
+            annotationColor.setStroke()
+            path.stroke()
+        }
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -107,19 +208,18 @@ final class ImageCanvas: NSView {
         if t == 0 { return image }
         let s = image.size
         let out = t % 2 == 1 ? NSSize(width: s.height, height: s.width) : s
-        return NSImage(size: out, flipped: false) { rect in
-            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
-            ctx.translateBy(x: rect.midX, y: rect.midY)
+        return ImageEdit.rasterize(image, outSize: out) { ctx, src, out, cg in
+            ctx.translateBy(x: out.width / 2, y: out.height / 2)
             ctx.rotate(by: -CGFloat(t) * .pi / 2)
-            image.draw(in: NSRect(x: -s.width / 2, y: -s.height / 2, width: s.width, height: s.height))
-            return true
-        }
+            ctx.draw(cg, in: CGRect(x: -src.width / 2, y: -src.height / 2, width: src.width, height: src.height))
+        } ?? image
     }
     func actualSize() { zoom = 1; offset = .zero; needsDisplay = true }
 
     func zoomBy(_ factor: CGFloat) {
         let current = zoom ?? fitScale
         zoom = min(max(current * factor, 0.02), 32)
+        cropRect = nil
         needsDisplay = true
     }
 
@@ -131,11 +231,35 @@ final class ImageCanvas: NSView {
         } else if zoom != nil {
             offset.x += event.scrollingDeltaX
             offset.y -= event.scrollingDeltaY
+            cropRect = nil
             needsDisplay = true
         }
     }
 
+    override func mouseUp(with event: NSEvent) {
+        guard tool != .none, drawPoints.count >= 2, let image else { return }
+        let shape = AnnotationShape(tool: tool, points: drawPoints,
+                                    width: annotationWidth * ImageEdit.strokeScale(image.size))
+        drawPoints = []
+        needsDisplay = true
+        onShape?(shape)
+    }
+
     override func mouseDragged(with event: NSEvent) {
+        if tool != .none, !drawPoints.isEmpty, tool != .text {
+            let p = toImage(convert(event.locationInWindow, from: nil))
+            if tool == .pen { drawPoints.append(p) } else { drawPoints = [drawPoints[0], p] }
+            needsDisplay = true
+            return
+        }
+        if cropMode, let start = cropStart {
+            let p = convert(event.locationInWindow, from: nil)
+            cropRect = NSRect(x: min(start.x, p.x), y: min(start.y, p.y),
+                              width: abs(p.x - start.x), height: abs(p.y - start.y))
+                .intersection(imageRect)
+            needsDisplay = true
+            return
+        }
         guard zoom != nil else { return }
         offset.x += event.deltaX
         offset.y -= event.deltaY
@@ -143,6 +267,17 @@ final class ImageCanvas: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        if tool != .none, image != nil {
+            let p = toImage(convert(event.locationInWindow, from: nil))
+            if tool == .text { onText?(p) } else { drawPoints = [p] }
+            return
+        }
+        if cropMode {
+            cropStart = convert(event.locationInWindow, from: nil)
+            cropRect = nil
+            needsDisplay = true
+            return
+        }
         if event.clickCount == 2 {
             if zoom == nil { actualSize() } else { fit() }
         }
@@ -275,6 +410,195 @@ enum ImageInfo {
     }
 }
 
+// MARK: - Editing operations
+
+enum AnnotationTool: Int {
+    case none, line, arrow, rect, ellipse, pen, text
+}
+
+struct AnnotationShape {
+    var tool: AnnotationTool
+    var points: [NSPoint]
+    var width: CGFloat
+}
+
+enum ImageEdit {
+    private static let ciContext = CIContext()
+
+    static func cgImage(_ image: NSImage) -> CGImage? {
+        image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+    }
+
+    /// Renders at the source's full pixel resolution (not the point size).
+    static func rasterize(_ image: NSImage, outSize: NSSize? = nil,
+                          _ draw: (CGContext, NSSize, NSSize, CGImage) -> Void) -> NSImage? {
+        guard let cg = cgImage(image), image.size.width > 0 else { return nil }
+        let k = CGFloat(cg.width) / image.size.width
+        let out = outSize ?? image.size
+        let w = max(1, Int((out.width * k).rounded())), h = max(1, Int((out.height * k).rounded()))
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.scaleBy(x: k, y: k)
+        draw(ctx, image.size, out, cg)
+        guard let result = ctx.makeImage() else { return nil }
+        return NSImage(cgImage: result, size: out)
+    }
+
+    static func flip(_ image: NSImage, horizontal: Bool) -> NSImage {
+        rasterize(image) { ctx, s, _, cg in
+            if horizontal {
+                ctx.translateBy(x: s.width, y: 0); ctx.scaleBy(x: -1, y: 1)
+            } else {
+                ctx.translateBy(x: 0, y: s.height); ctx.scaleBy(x: 1, y: -1)
+            }
+            ctx.draw(cg, in: CGRect(origin: .zero, size: s))
+        } ?? image
+    }
+
+    /// Stroke width / font size multiplier so marks look similar on small and huge pictures.
+    static func strokeScale(_ size: NSSize) -> CGFloat { max(1, max(size.width, size.height) / 800) }
+
+    static func path(for shape: AnnotationShape, headScale: CGFloat,
+                     map: (NSPoint) -> NSPoint) -> NSBezierPath {
+        let pts = shape.points.map(map)
+        let path = NSBezierPath()
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        guard let a = pts.first, let b = pts.last else { return path }
+        let box = NSRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
+        switch shape.tool {
+        case .line:
+            path.move(to: a); path.line(to: b)
+        case .arrow:
+            path.move(to: a); path.line(to: b)
+            let angle = atan2(b.y - a.y, b.x - a.x)
+            let len = shape.width * 4 * headScale + 6 * headScale
+            for d in [CGFloat.pi * 5 / 6, -CGFloat.pi * 5 / 6] {
+                path.move(to: b)
+                path.line(to: NSPoint(x: b.x + len * cos(angle + d), y: b.y + len * sin(angle + d)))
+            }
+        case .rect: path.appendRect(box)
+        case .ellipse: path.appendOval(in: box)
+        case .pen:
+            path.move(to: a)
+            pts.dropFirst().forEach { path.line(to: $0) }
+        case .text, .none: break
+        }
+        return path
+    }
+
+    static func render(_ shape: AnnotationShape, color: NSColor, onto image: NSImage) -> NSImage? {
+        rasterize(image) { ctx, s, _, cg in
+            ctx.draw(cg, in: CGRect(origin: .zero, size: s))
+            withGraphics(ctx) {
+                let p = path(for: shape, headScale: 1) { $0 }
+                p.lineWidth = shape.width
+                color.setStroke()
+                p.stroke()
+            }
+        }
+    }
+
+    static func renderText(_ text: String, at point: NSPoint, color: NSColor, fontSize: CGFloat,
+                           onto image: NSImage) -> NSImage? {
+        rasterize(image) { ctx, s, _, cg in
+            ctx.draw(cg, in: CGRect(origin: .zero, size: s))
+            withGraphics(ctx) {
+                let str = NSAttributedString(string: text, attributes: [
+                    .font: NSFont.boldSystemFont(ofSize: fontSize), .foregroundColor: color])
+                let box = str.boundingRect(with: NSSize(width: 100_000, height: 100_000),
+                                           options: [.usesLineFragmentOrigin])
+                str.draw(with: NSRect(x: point.x, y: point.y - box.height, width: box.width + 4, height: box.height),
+                         options: [.usesLineFragmentOrigin])
+            }
+        }
+    }
+
+    private static func withGraphics(_ ctx: CGContext, _ body: () -> Void) {
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        body()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    /// `rect` is in image points, origin bottom-left.
+    static func crop(_ image: NSImage, to rect: NSRect) -> NSImage? {
+        guard let cg = cgImage(image), image.size.width > 0 else { return nil }
+        let k = CGFloat(cg.width) / image.size.width
+        let px = CGRect(x: rect.minX * k, y: (image.size.height - rect.maxY) * k,
+                        width: rect.width * k, height: rect.height * k).integral
+        guard let out = cg.cropping(to: px) else { return nil }
+        return NSImage(cgImage: out, size: NSSize(width: CGFloat(out.width) / k, height: CGFloat(out.height) / k))
+    }
+
+    static func adjust(_ image: NSImage, brightness: Double, contrast: Double, saturation: Double) -> NSImage? {
+        guard let cg = cgImage(image), let f = CIFilter(name: "CIColorControls") else { return nil }
+        f.setValue(CIImage(cgImage: cg), forKey: kCIInputImageKey)
+        f.setValue(brightness, forKey: kCIInputBrightnessKey)
+        f.setValue(contrast, forKey: kCIInputContrastKey)
+        f.setValue(saturation, forKey: kCIInputSaturationKey)
+        guard let out = f.outputImage, let res = ciContext.createCGImage(out, from: out.extent) else { return nil }
+        return NSImage(cgImage: res, size: image.size)
+    }
+
+    static let writableExtensions: Set<String> = ["jpg", "jpeg", "png", "tif", "tiff"]
+
+    static func encode(_ image: NSImage, as ext: String) -> Data? {
+        guard let cg = cgImage(image) else { return nil }
+        let rep = NSBitmapImageRep(cgImage: cg)
+        switch ext.lowercased() {
+        case "jpg", "jpeg": return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.92])
+        case "tif", "tiff": return rep.representation(using: .tiff, properties: [:])
+        default: return rep.representation(using: .png, properties: [:])
+        }
+    }
+}
+
+/// Popover content: three sliders with live preview.
+final class AdjustController: NSViewController {
+    var onChange: ((Double, Double, Double) -> Void)?
+    var onApply: ((Double, Double, Double) -> Void)?
+    private let brightness = NSSlider(value: 0, minValue: -0.5, maxValue: 0.5, target: nil, action: nil)
+    private let contrast = NSSlider(value: 1, minValue: 0.5, maxValue: 1.5, target: nil, action: nil)
+    private let saturation = NSSlider(value: 1, minValue: 0, maxValue: 2, target: nil, action: nil)
+
+    private var values: (Double, Double, Double) {
+        (brightness.doubleValue, contrast.doubleValue, saturation.doubleValue)
+    }
+
+    override func loadView() {
+        func row(_ title: String, _ slider: NSSlider) -> NSStackView {
+            slider.target = self
+            slider.action = #selector(changed)
+            slider.widthAnchor.constraint(equalToConstant: 160).isActive = true
+            let label = NSTextField(labelWithString: title)
+            label.widthAnchor.constraint(equalToConstant: 70).isActive = true
+            return NSStackView(views: [label, slider])
+        }
+        let reset = NSButton(title: "Reset", target: self, action: #selector(resetValues))
+        let apply = NSButton(title: "Apply", target: self, action: #selector(apply))
+        apply.keyEquivalent = "\r"
+        let buttons = NSStackView(views: [reset, apply])
+        let stack = NSStackView(views: [row("Brightness", brightness), row("Contrast", contrast),
+                                        row("Saturation", saturation), buttons])
+        stack.orientation = .vertical
+        stack.alignment = .trailing
+        stack.spacing = 10
+        stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+        stack.frame.size = stack.fittingSize
+        view = stack
+    }
+
+    @objc private func changed() { let v = values; onChange?(v.0, v.1, v.2) }
+    @objc private func resetValues() {
+        brightness.doubleValue = 0; contrast.doubleValue = 1; saturation.doubleValue = 1
+        changed()
+    }
+    @objc private func apply() { let v = values; onApply?(v.0, v.1, v.2) }
+}
+
 // MARK: - Printing
 
 enum PrintScaleMode: Int, CaseIterable {
@@ -402,7 +726,7 @@ final class PrintOptionsController: NSViewController, NSPrintPanelAccessorizing 
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation, NSPopoverDelegate {
     private var window: NSWindow!
     private let canvas = ImageCanvas()
     private let prevButton = NSButton()
@@ -428,6 +752,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var showStrip = false
     private var showInfo = false
     private let toolbar = NSStackView()
+    private let editBar = NSStackView()
+    private var cropButton: NSButton!
+    private let annotBar = NSStackView()
+    private var toolButtons: [AnnotationTool: NSButton] = [:]
+    private let colorWell = NSColorWell()
+    private let widthPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let widthValues: [CGFloat] = [2, 4, 7, 12]
+    private var undoStack: [NSImage] = []
+    private var edited = false
+    private var adjustBase: NSImage?
+    private var adjustApplied = false
+    private var adjustPopover: NSPopover?
+    private var adjustButton: NSButton!
     private var slideshowButton: NSButton!
     private var infoButton: NSButton!
     private var thumbsButton: NSButton!
@@ -482,7 +819,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         strip.isHidden = true
         strip.onSelect = { [weak self] i in
             guard let self, self.files.indices.contains(i) else { return }
-            self.index = i; self.show()
+            self.goTo(i)
         }
         content.addSubview(canvas)
         content.addSubview(strip)
@@ -550,6 +887,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         toolbar.topAnchor.constraint(equalTo: content.topAnchor, constant: 12).isActive = true
         toolbar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12).isActive = true
 
+        cropButton = tool("crop", "Crop: drag a region, then click again to apply (⌘K)", #selector(cropAction))
+        adjustButton = tool("slider.horizontal.3", "Adjust brightness / contrast / saturation", #selector(showAdjust))
+        editBar.setViews([
+            cropButton,
+            tool("arrow.left.and.right.righttriangle.left.righttriangle.right", "Flip horizontally", #selector(flipHorizontal)),
+            tool("arrow.up.and.down.righttriangle.up.righttriangle.down", "Flip vertically", #selector(flipVertical)),
+            adjustButton,
+            tool("arrow.uturn.backward", "Undo (⌘Z)", #selector(undoEdit)),
+            tool("square.and.arrow.down", "Save (⌘S)", #selector(saveImage)),
+            tool("square.and.arrow.down.on.square", "Save a copy… (⇧⌘S)", #selector(saveCopy)),
+        ], in: .leading)
+        editBar.spacing = 2
+        editBar.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
+        editBar.wantsLayer = true
+        editBar.layer?.backgroundColor = NSColor(white: 0, alpha: 0.6).cgColor
+        editBar.layer?.cornerRadius = 10
+        editBar.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(editBar)
+        editBar.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 6).isActive = true
+        editBar.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor).isActive = true
+        canvas.onCropModeChange = { [weak self] in
+            guard let self else { return }
+            self.cropButton.contentTintColor = self.canvas.cropMode
+                ? .controlAccentColor : NSColor(white: 1, alpha: 0.85)
+        }
+        canvas.onEscape = { [weak self] in
+            self?.canvas.cropMode = false
+            self?.canvas.tool = .none
+        }
+
+        let toolDefs: [(AnnotationTool, String, String)] = [
+            (.line, "line.diagonal", "Line"), (.arrow, "arrow.up.right", "Arrow"),
+            (.rect, "rectangle", "Rectangle"), (.ellipse, "circle", "Circle / ellipse"),
+            (.pen, "pencil.tip", "Freehand pen"), (.text, "textformat", "Text"),
+        ]
+        var annotViews: [NSView] = []
+        for (t, symbol, name) in toolDefs {
+            let b = tool(symbol, name + " (click again to turn off)", #selector(selectTool(_:)))
+            b.tag = t.rawValue
+            toolButtons[t] = b
+            annotViews.append(b)
+        }
+        colorWell.color = .systemRed
+        colorWell.target = self
+        colorWell.action = #selector(styleChanged)
+        colorWell.toolTip = "Annotation color"
+        colorWell.widthAnchor.constraint(equalToConstant: 32).isActive = true
+        colorWell.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        widthPopup.addItems(withTitles: ["Thin", "Medium", "Thick", "Heavy"])
+        widthPopup.selectItem(at: 1)
+        widthPopup.controlSize = .small
+        widthPopup.font = .systemFont(ofSize: 11)
+        widthPopup.toolTip = "Line width / text size"
+        widthPopup.target = self
+        widthPopup.action = #selector(styleChanged)
+        annotViews += [colorWell, widthPopup]
+        annotBar.setViews(annotViews, in: .leading)
+        annotBar.spacing = 4
+        annotBar.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
+        annotBar.wantsLayer = true
+        annotBar.layer?.backgroundColor = NSColor(white: 0, alpha: 0.6).cgColor
+        annotBar.layer?.cornerRadius = 10
+        annotBar.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(annotBar)
+        annotBar.topAnchor.constraint(equalTo: editBar.bottomAnchor, constant: 6).isActive = true
+        annotBar.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor).isActive = true
+        canvas.onToolChange = { [weak self] in
+            guard let self else { return }
+            for (t, b) in self.toolButtons {
+                b.contentTintColor = self.canvas.tool == t ? .controlAccentColor : NSColor(white: 1, alpha: 0.85)
+            }
+        }
+        canvas.onShape = { [weak self] shape in
+            guard let self, let img = self.currentImage,
+                  let out = ImageEdit.render(shape, color: self.canvas.annotationColor, onto: img) else { return }
+            self.applyEdit(out, keepView: true)
+        }
+        canvas.onText = { [weak self] p in self?.addText(at: p) }
+        styleChanged()
+
         configure(prevButton, symbol: "chevron.left.circle.fill", action: #selector(previous))
         configure(nextButton, symbol: "chevron.right.circle.fill", action: #selector(next))
         for b in [prevButton, nextButton] {
@@ -590,6 +1007,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     private func open(_ url: URL) {
         setUpIfNeeded()
+        guard confirmDiscard() else { return }
+        edited = false
         var isDir: ObjCBool = false
         FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
         if isDir.boolValue {
@@ -619,14 +1038,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         currentImage = NSImage(contentsOf: url)
         canvas.image = currentImage
 
-        var title = "\(url.lastPathComponent)  —  \(index + 1) / \(files.count)"
-        if let rep = currentImage?.representations.first {
-            let w = rep.pixelsWide, h = rep.pixelsHigh
-            if w > 0, h > 0 { title += "  —  \(w)×\(h)" }
-        } else {
-            title += "  —  (cannot open)"
-        }
-        window.title = title
+        undoStack = []
+        edited = false
+        canvas.cropMode = false
+        updateTitle()
         window.representedURL = url
         prevButton.isEnabled = index > 0
         nextButton.isEnabled = index < files.count - 1
@@ -634,6 +1049,189 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         nextButton.alphaValue = nextButton.isEnabled ? 1 : 0.25
         strip.select(index)
         updateInfo()
+    }
+
+    private func updateTitle() {
+        guard files.indices.contains(index) else { return }
+        var title = "\(files[index].lastPathComponent)  —  \(index + 1) / \(files.count)"
+        if let rep = currentImage?.representations.first {
+            let w = rep.pixelsWide, h = rep.pixelsHigh
+            if w > 0, h > 0 { title += "  —  \(w)×\(h)" }
+        } else {
+            title += "  —  (cannot open)"
+        }
+        if edited { title += "  —  edited" }
+        window.title = title
+        window.isDocumentEdited = edited
+    }
+
+    // MARK: Editing
+
+    private func confirmDiscard() -> Bool {
+        guard edited else { return true }
+        let alert = NSAlert()
+        alert.messageText = "Discard unsaved edits?"
+        alert.informativeText = "This picture has changes that have not been saved."
+        alert.addButton(withTitle: "Discard")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool { confirmDiscard() }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        confirmDiscard() ? .terminateNow : .terminateCancel
+    }
+
+    private func applyEdit(_ new: NSImage, keepView: Bool = false) {
+        if let cur = currentImage { undoStack.append(cur) }
+        currentImage = new
+        if keepView { canvas.replaceImage(new) } else { canvas.image = new }
+        edited = true
+        updateTitle()
+        updateInfo()
+    }
+
+    /// Make the current view rotation permanent in the working image.
+    private func bakeRotation() {
+        if canvas.quarterTurns != 0, let r = canvas.rotatedImage { applyEdit(r) }
+    }
+
+    @objc func undoEdit() {
+        guard let prev = undoStack.popLast() else { NSSound.beep(); return }
+        currentImage = prev
+        canvas.image = prev
+        edited = !undoStack.isEmpty
+        updateTitle()
+        updateInfo()
+    }
+
+    @objc func flipHorizontal() { flip(horizontal: true) }
+    @objc func flipVertical() { flip(horizontal: false) }
+
+    private func flip(horizontal: Bool) {
+        bakeRotation()
+        guard let img = currentImage else { return }
+        applyEdit(ImageEdit.flip(img, horizontal: horizontal), keepView: true)
+    }
+
+    @objc func cropAction() {
+        guard currentImage != nil else { NSSound.beep(); return }
+        if !canvas.cropMode {
+            bakeRotation()
+            canvas.cropMode = true
+        } else if let r = canvas.cropRectInImage, let img = currentImage, let out = ImageEdit.crop(img, to: r) {
+            canvas.cropMode = false
+            applyEdit(out)
+        } else {
+            canvas.cropMode = false
+        }
+    }
+
+    @objc func selectTool(_ sender: NSButton) {
+        guard currentImage != nil, let t = AnnotationTool(rawValue: sender.tag) else { NSSound.beep(); return }
+        if canvas.tool == t { canvas.tool = .none; return }
+        canvas.cropMode = false
+        bakeRotation()
+        canvas.tool = t
+    }
+
+    @objc private func styleChanged() {
+        canvas.annotationColor = colorWell.color
+        canvas.annotationWidth = widthValues[max(0, widthPopup.indexOfSelectedItem)]
+    }
+
+    private func addText(at point: NSPoint) {
+        guard let img = currentImage else { return }
+        let alert = NSAlert()
+        alert.messageText = "Add text"
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty else { return }
+        let size = canvas.annotationWidth * 6 * ImageEdit.strokeScale(img.size)
+        if let out = ImageEdit.renderText(field.stringValue, at: point, color: canvas.annotationColor,
+                                          fontSize: size, onto: img) {
+            applyEdit(out, keepView: true)
+        }
+    }
+
+    @objc func showAdjust() {
+        guard currentImage != nil else { NSSound.beep(); return }
+        canvas.cropMode = false
+        canvas.tool = .none
+        bakeRotation()
+        guard let base = currentImage else { return }
+        adjustBase = base
+        adjustApplied = false
+        let controller = AdjustController()
+        controller.onChange = { [weak self] b, c, s in
+            guard let self, let base = self.adjustBase,
+                  let out = ImageEdit.adjust(base, brightness: b, contrast: c, saturation: s) else { return }
+            self.canvas.replaceImage(out)
+        }
+        controller.onApply = { [weak self] b, c, s in
+            guard let self, let base = self.adjustBase else { return }
+            self.adjustApplied = true
+            self.adjustPopover?.close()
+            if let out = ImageEdit.adjust(base, brightness: b, contrast: c, saturation: s) {
+                self.applyEdit(out, keepView: true)
+            }
+        }
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = controller
+        popover.delegate = self
+        adjustPopover = popover
+        popover.show(relativeTo: adjustButton.bounds, of: adjustButton, preferredEdge: .maxY)
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        if !adjustApplied, let cur = currentImage { canvas.replaceImage(cur) }
+        adjustPopover = nil
+    }
+
+    @objc func saveImage() {
+        guard files.indices.contains(index), let img = canvas.rotatedImage else { return }
+        let url = files[index]
+        guard ImageEdit.writableExtensions.contains(url.pathExtension.lowercased()) else { return saveCopy() }
+        let alert = NSAlert()
+        alert.messageText = "Overwrite \"\(url.lastPathComponent)\"?"
+        alert.informativeText = "The original file will be replaced. Use Save a Copy to keep it."
+        alert.addButton(withTitle: "Overwrite")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let data = ImageEdit.encode(img, as: url.pathExtension) else { NSSound.beep(); return }
+        do {
+            try data.write(to: url, options: .atomic)
+            edited = false
+            reloadStrip()
+            show()
+        } catch {
+            NSAlert(error: error).runModal()
+        }
+    }
+
+    @objc func saveCopy() {
+        guard files.indices.contains(index), let img = canvas.rotatedImage else { NSSound.beep(); return }
+        let src = files[index]
+        let ext = ImageEdit.writableExtensions.contains(src.pathExtension.lowercased())
+            ? src.pathExtension.lowercased() : "png"
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png, .jpeg, .tiff]
+        panel.directoryURL = src.deletingLastPathComponent()
+        panel.nameFieldStringValue = src.deletingPathExtension().lastPathComponent + " edited." + ext
+        guard panel.runModal() == .OK, let dest = panel.url else { return }
+        guard let data = ImageEdit.encode(img, as: dest.pathExtension) else { NSSound.beep(); return }
+        do {
+            try data.write(to: dest, options: .atomic)
+            edited = false
+            open(dest)
+        } catch {
+            NSAlert(error: error).runModal()
+        }
     }
 
     private func updateInfo() {
@@ -681,7 +1279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         } else {
             guard files.count > 1 else { NSSound.beep(); return }
             slideshowTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-                guard let self else { return }
+                guard let self, !self.edited else { return }
                 self.index = (self.index + 1) % self.files.count
                 self.show()
             }
@@ -722,10 +1320,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
 
-    @objc func previous() { if index > 0 { index -= 1; show() } }
-    @objc func next() { if index < files.count - 1 { index += 1; show() } }
-    @objc func first() { index = 0; show() }
-    @objc func last() { index = max(0, files.count - 1); show() }
+    private func goTo(_ i: Int) {
+        guard files.indices.contains(i), i != index, confirmDiscard() else { return }
+        index = i
+        show()
+    }
+
+    @objc func previous() { goTo(index - 1) }
+    @objc func next() { goTo(index + 1) }
+    @objc func first() { goTo(0) }
+    @objc func last() { goTo(files.count - 1) }
     @objc func fitToWindow() { canvas.fit() }
     @objc func actualSize() { canvas.actualSize() }
     @objc func zoomIn() { canvas.zoomBy(1.25) }
@@ -793,8 +1397,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             return !files.isEmpty
         case #selector(printImage), #selector(fitToWindow), #selector(actualSize),
              #selector(zoomIn), #selector(zoomOut), #selector(rotateLeft), #selector(rotateRight),
-             #selector(copyImage):
+             #selector(copyImage), #selector(flipHorizontal), #selector(flipVertical),
+             #selector(cropAction), #selector(showAdjust), #selector(saveImage), #selector(saveCopy):
             return currentImage != nil
+        case #selector(undoEdit):
+            return !undoStack.isEmpty
         default: return true
         }
     }
@@ -834,6 +1441,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         add(file, "Page Setup…", #selector(pageSetup), "p", [.command, .shift])
         add(file, "Print…", #selector(printImage), "p")
         file.addItem(.separator())
+        add(file, "Save…", #selector(saveImage), "s")
+        add(file, "Save a Copy…", #selector(saveCopy), "s", [.command, .shift])
         add(file, "Rename…", #selector(renameFile), "e")
         add(file, "Show in Finder", #selector(revealInFinder), "r")
         add(file, "Move to Trash", #selector(moveToTrash), "\u{8}")
@@ -841,7 +1450,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         add(file, "Close", #selector(NSWindow.performClose(_:)), "w")
 
         let edit = submenu("Edit")
+        add(edit, "Undo", #selector(undoEdit), "z")
+        edit.addItem(.separator())
         add(edit, "Copy", #selector(copyImage), "c")
+        edit.addItem(.separator())
+        add(edit, "Crop", #selector(cropAction), "k")
+        add(edit, "Flip Horizontally", #selector(flipHorizontal))
+        add(edit, "Flip Vertically", #selector(flipVertical))
+        add(edit, "Adjust Colors…", #selector(showAdjust))
 
         let view = submenu("View")
         add(view, "Previous Picture", #selector(previous), arrow(NSLeftArrowFunctionKey), [])
