@@ -134,6 +134,13 @@ final class ImageCanvas: NSView {
         return ImageEdit.rotated(NSPoint(x: c.x, y: b.maxY + 26 / k), about: c, by: a.angle)
     }
 
+    /// The middle of what's currently on screen, in image points (clamped to the picture).
+    func visibleCenterInImage() -> NSPoint? {
+        guard let image else { return nil }
+        let q = toImage(NSPoint(x: bounds.midX, y: bounds.midY))
+        return NSPoint(x: min(max(q.x, 0), image.size.width), y: min(max(q.y, 0), image.size.height))
+    }
+
     private func isOnWidthHandle(_ p: NSPoint) -> Bool {
         guard let i = selected, annotations.indices.contains(i), annotations[i].tool == .text else { return false }
         let q = ImageEdit.widthHandle(for: annotations[i])
@@ -397,8 +404,22 @@ final class ImageCanvas: NSView {
                 // Keep the opposite corner fixed in the picture, even when rotated.
                 let j = 1 - h
                 let opp = ImageEdit.rotated(a.points[j], about: ImageEdit.center(of: a), by: a.angle)
-                let c = NSPoint(x: (p.x + opp.x) / 2, y: (p.y + opp.y) / 2)
-                a.points[h] = ImageEdit.rotated(p, about: c, by: -a.angle)
+                var target = p
+                if a.tool == .image, let img = a.image, img.size.height > 0 {
+                    // Pictures keep their proportions while resizing.
+                    let aspect = img.size.width / img.size.height
+                    let dx = p.x - opp.x, dy = p.y - opp.y
+                    let lx = dx * cos(a.angle) + dy * sin(a.angle)
+                    let ly = -dx * sin(a.angle) + dy * cos(a.angle)
+                    var w = abs(lx), hh = abs(ly)
+                    if w > hh * aspect { hh = w / aspect } else { w = hh * aspect }
+                    let sx: CGFloat = lx < 0 ? -1 : 1, sy: CGFloat = ly < 0 ? -1 : 1
+                    let nx = sx * w, ny = sy * hh
+                    target = NSPoint(x: opp.x + nx * cos(a.angle) - ny * sin(a.angle),
+                                     y: opp.y + nx * sin(a.angle) + ny * cos(a.angle))
+                }
+                let c = NSPoint(x: (target.x + opp.x) / 2, y: (target.y + opp.y) / 2)
+                a.points[h] = ImageEdit.rotated(target, about: c, by: -a.angle)
                 a.points[j] = ImageEdit.rotated(opp, about: c, by: -a.angle)
                 annotations[i] = a
                 return
@@ -610,13 +631,13 @@ enum ImageInfo {
 // MARK: - Editing operations
 
 enum AnnotationTool: Int {
-    case none, line, arrow, rect, ellipse, pen, text, mosaic
+    case none, line, arrow, rect, ellipse, pen, text, mosaic, image
 
     /// Two-point shapes whose end points can be dragged.
-    var hasHandles: Bool { [.line, .arrow, .rect, .ellipse, .mosaic].contains(self) }
+    var hasHandles: Bool { [.line, .arrow, .rect, .ellipse, .mosaic, .image].contains(self) }
 
     /// Shapes that get a rotation knob (lines and arrows already point anywhere via their end points).
-    var canRotate: Bool { [.rect, .ellipse, .text].contains(self) }
+    var canRotate: Bool { [.rect, .ellipse, .text, .image].contains(self) }
 }
 
 /// A mark drawn over the picture. Points are in image points, origin bottom-left.
@@ -637,6 +658,8 @@ struct Annotation {
     var fontName = ""
     var bold = true
     var italic = false
+    /// Pasted picture (tool == .image); points are two opposite corners.
+    var image: NSImage?
 }
 
 enum ImageEdit {
@@ -696,7 +719,7 @@ enum ImageEdit {
                 path.move(to: b)
                 path.line(to: NSPoint(x: b.x + len * cos(angle + d), y: b.y + len * sin(angle + d)))
             }
-        case .rect, .mosaic: path.appendRect(box)
+        case .rect, .mosaic, .image: path.appendRect(box)
         case .ellipse: path.appendOval(in: box)
         case .pen:
             path.move(to: a)
@@ -791,6 +814,15 @@ enum ImageEdit {
             return
         }
         if a.angle != 0 { concatRotation(a.angle, about: map(center(of: a))) }
+        if a.tool == .image {
+            guard let img = a.image, a.points.count == 2 else { return }
+            let p0 = map(a.points[0]), p1 = map(a.points[1])
+            NSGraphicsContext.current?.imageInterpolation = .high
+            img.draw(in: NSRect(x: min(p0.x, p1.x), y: min(p0.y, p1.y),
+                                width: abs(p1.x - p0.x), height: abs(p1.y - p0.y)),
+                     from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            return
+        }
         if a.tool == .text {
             guard let p = a.points.first else { return }
             let o = map(p)
@@ -845,6 +877,7 @@ enum ImageEdit {
 
     /// Smallest distance (image points) from `p` to the annotation's outline.
     static func distance(from point: NSPoint, to a: Annotation) -> CGFloat {
+        if a.tool == .image { return bounds(of: a).contains(rotated(point, about: center(of: a), by: -a.angle)) ? 0 : .greatestFiniteMagnitude }
         if a.tool == .mosaic { return bounds(of: a).contains(point) ? 0 : .greatestFiniteMagnitude }
         let p = a.angle == 0 ? point : rotated(point, about: center(of: a), by: -a.angle)
         if a.tool == .text { return textRect(a).contains(p) ? 0 : .greatestFiniteMagnitude }
@@ -1246,6 +1279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             tool("arrow.up.left.and.down.right.magnifyingglass", "Fit to window (⌘0)", #selector(fitToWindow)),
             slideshowButton, infoButton, thumbsButton,
             tool("doc.on.doc", "Copy image (⌘C)", #selector(copyImage)),
+            tool("doc.on.clipboard", "Paste picture (⌘V)", #selector(pasteImage)),
             tool("pencil", "Rename (⌘E)", #selector(renameFile)),
             tool("trash", "Move to Trash (⌘⌫)", #selector(moveToTrash)),
         ], in: .leading)
@@ -1622,7 +1656,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         updateFontButtonTints()
         canvas.annotationColor = colorWell.color
         canvas.annotationWidth = widthValues[max(0, widthPopup.indexOfSelectedItem)]
-        guard let i = canvas.selected, canvas.annotations.indices.contains(i), let img = currentImage else { return }
+        guard let i = canvas.selected, canvas.annotations.indices.contains(i), let img = currentImage,
+              canvas.annotations[i].tool != .image else { return }
         pushUndo(style: true)
         let scale = ImageEdit.strokeScale(img.size)
         canvas.annotations[i].color = canvas.annotationColor
@@ -1824,10 +1859,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             open(u)
             return
         }
-        guard let img = NSImage(pasteboard: pb), let data = ImageEdit.encode(img, as: "png") else {
-            NSSound.beep()
+        guard let img = NSImage(pasteboard: pb) else { NSSound.beep(); return }
+        if currentImage != nil {
+            addPastedImage(img)       // lands on top of the open picture as a movable, resizable layer
             return
         }
+        guard let data = ImageEdit.encode(img, as: "png") else { NSSound.beep(); return }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(Self.pasteFolder)
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd HH.mm.ss"
@@ -1839,6 +1876,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         } catch {
             NSAlert(error: error).runModal()
         }
+    }
+
+    private func addPastedImage(_ img: NSImage) {
+        canvas.cropMode = false
+        canvas.tool = .none
+        bakeRotation()
+        guard let base = currentImage, img.size.width > 0, img.size.height > 0 else { return }
+        // Start at a sensible size: never larger than 60% of the picture underneath.
+        let k = min(1, base.size.width * 0.6 / img.size.width, base.size.height * 0.6 / img.size.height)
+        let w = img.size.width * k, h = img.size.height * k
+        let c = canvas.visibleCenterInImage() ?? NSPoint(x: base.size.width / 2, y: base.size.height / 2)
+        pushUndo()
+        canvas.annotations.append(Annotation(
+            tool: .image,
+            points: [NSPoint(x: c.x - w / 2, y: c.y - h / 2), NSPoint(x: c.x + w / 2, y: c.y + h / 2)],
+            width: 0, color: .clear, image: img))
+        canvas.selected = canvas.annotations.count - 1
     }
 
     @objc func rotateLeft() { canvas.rotate(by: -1) }
