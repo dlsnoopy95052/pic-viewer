@@ -1994,8 +1994,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         if slideshowTimer != nil { toggleSlideshow() }
         capturing = true
-        window.orderOut(nil)                    // keep our own window out of the shot
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
+        // Our window stays where it is, so it can be part of the shot.
+        DispatchQueue.main.async { [self] in
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
             task.arguments = ["-i", "-s", "-x", "-t", "png", url.path]   // area selection only, no sound
