@@ -1,3 +1,4 @@
+import Carbon.HIToolbox
 import Cocoa
 import CoreImage
 import ImageIO
@@ -1163,6 +1164,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let fontPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let boldButton = NSButton()
     private let italicButton = NSButton()
+    private var capturing = false
+    private var hotKeyRef: EventHotKeyRef?
+    private var copyCaptures: Bool {
+        get { UserDefaults.standard.bool(forKey: "copyCaptures") }
+        set { UserDefaults.standard.set(newValue, forKey: "copyCaptures") }
+    }
     private var undoStack: [(image: NSImage?, annotations: [Annotation])] = []
     private var lastUndoWasStyle = false
     private var edited = false
@@ -1183,6 +1190,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func setUpIfNeeded() {
         guard !didSetUp else { return }
         didSetUp = true
+        UserDefaults.standard.register(defaults: ["copyCaptures": true])
+        registerCaptureHotKey()
         buildMenu()
         buildWindow()
     }
@@ -1195,11 +1204,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         setUpIfNeeded()
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.main.async { [self] in
-            if files.isEmpty { openPanel() }
+            if files.isEmpty { window.makeKeyAndOrderFront(nil) }   // empty window; ⌘O or drop a file
         }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// Stay running with no window so the global capture hot key keeps working; quit with ⌘Q.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !flag else { return true }
+        window.makeKeyAndOrderFront(nil)
+        return false
+    }
 
     func application(_ application: NSApplication, open urls: [URL]) {
         if let url = urls.first { open(url) }
@@ -1272,6 +1288,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         infoButton = tool("info.circle", "Show info (I)", #selector(toggleInfo))
         thumbsButton = tool("square.grid.3x1.below.line.grid.1x2", "Show thumbnails (T)", #selector(toggleThumbnails))
         toolbar.setViews([
+            tool("camera.viewfinder", "Capture a screen area (⌥⌘4)", #selector(captureArea)),
             tool("rotate.left", "Rotate left (⌘[)", #selector(rotateLeft)),
             tool("rotate.right", "Rotate right (⌘])", #selector(rotateRight)),
             tool("minus.magnifyingglass", "Zoom out (⌘-)", #selector(zoomOut)),
@@ -1471,7 +1488,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = true
         if panel.runModal() == .OK, let url = panel.url { open(url) }
-        else if files.isEmpty { NSApp.terminate(nil) }
     }
 
     private func open(_ url: URL) {
@@ -1895,6 +1911,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         canvas.selected = canvas.annotations.count - 1
     }
 
+    /// Global ⌥⌘4, works while another app is in front (Carbon hot keys need no extra permission).
+    private func registerCaptureHotKey() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            DispatchQueue.main.async { (NSApp.delegate as? AppDelegate)?.captureArea() }
+            return noErr
+        }, 1, &spec, nil, nil)
+        let id = EventHotKeyID(signature: OSType(0x50565748), id: 1)
+        RegisterEventHotKey(UInt32(kVK_ANSI_4), UInt32(cmdKey | optionKey), id,
+                            GetApplicationEventTarget(), 0, &hotKeyRef)
+    }
+
+    @objc func toggleCopyCaptures() { copyCaptures.toggle() }
+
+    @objc func captureArea() {
+        guard !capturing else { return }
+        guard CGPreflightScreenCaptureAccess() else {
+            CGRequestScreenCaptureAccess()
+            let alert = NSAlert()
+            alert.messageText = "Screen Recording permission needed"
+            alert.informativeText = "Allow Picture Viewer in System Settings → Privacy & Security → Screen Recording, then reopen the app and try again."
+            alert.runModal()
+            return
+        }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("PictureViewerCaptures")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH.mm.ss"
+        let url = dir.appendingPathComponent("Capture \(fmt.string(from: Date())).png")
+
+        if slideshowTimer != nil { toggleSlideshow() }
+        capturing = true
+        window.orderOut(nil)                    // keep our own window out of the shot
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            task.arguments = ["-i", "-s", "-x", "-t", "png", url.path]   // area selection only, no sound
+            task.terminationHandler = { _ in
+                DispatchQueue.main.async {
+                    self.capturing = false
+                    self.window.makeKeyAndOrderFront(nil)
+                    NSApp.activate(ignoringOtherApps: true)
+                    // No file means the selection was cancelled (Esc).
+                    guard FileManager.default.fileExists(atPath: url.path) else { return }
+                    if self.copyCaptures, let img = NSImage(contentsOf: url) {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.writeObjects([img])
+                    }
+                    self.open(url)
+                }
+            }
+            do { try task.run() } catch {
+                capturing = false
+                window.makeKeyAndOrderFront(nil)
+                NSSound.beep()
+            }
+        }
+    }
+
     @objc func rotateLeft() { canvas.rotate(by: -1) }
     @objc func rotateRight() { canvas.rotate(by: 1) }
 
@@ -2034,6 +2109,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let pb = NSPasteboard.general
             return NSImage.canInit(with: pb)
                 || pb.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+        case #selector(toggleCopyCaptures):
+            item.state = copyCaptures ? .on : .off
+            return true
         case #selector(toggleInfo):
             item.state = showInfo ? .on : .off
             return true
@@ -2084,6 +2162,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         let file = submenu("File")
         add(file, "Open…", #selector(openPanel), "o")
+        add(file, "Capture Screen Area", #selector(captureArea), "4", [.command, .option])
+        add(file, "Copy Captures to Clipboard", #selector(toggleCopyCaptures))
         file.addItem(.separator())
         add(file, "Page Setup…", #selector(pageSetup), "p", [.command, .shift])
         add(file, "Print…", #selector(printImage), "p")

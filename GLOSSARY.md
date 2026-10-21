@@ -8,6 +8,10 @@ A native macOS app for viewing the pictures in a folder, with light annotation a
 The file the user is viewing, browsing, annotating or editing.
 _Avoid_: Image, photo
 
+**Capture**:
+A Picture made by selecting an area of the screen with the global hot key; it opens in the viewer like any other Picture.
+_Avoid_: Screenshot, snip
+
 **Annotation**:
 An editable mark drawn over a Picture that can be moved, resized, restyled or deleted until the Picture is flattened. Kinds: line, arrow, rectangle, circle, pen, text, Mosaic, Pasted layer.
 _Avoid_: Mark, overlay, shape
