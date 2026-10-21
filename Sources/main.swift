@@ -2,6 +2,7 @@ import Carbon.HIToolbox
 import Cocoa
 import CoreImage
 import ImageIO
+import ServiceManagement
 import UniformTypeIdentifiers
 
 // MARK: - Supported formats
@@ -1202,10 +1203,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setUpIfNeeded()
-        NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.main.async { [self] in
-            if files.isEmpty { window.makeKeyAndOrderFront(nil) }   // empty window; ⌘O or drop a file
+        buildStatusItem()
+        // No window until a picture is opened or the user asks for one: this is a menu bar app
+        // while idle, so launching at login stays out of the way.
+    }
+
+    private var statusItem: NSStatusItem?
+
+    private func buildStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.button?.image = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "Picture Viewer")
+        let menu = NSMenu()
+        func add(_ title: String, _ action: Selector, _ key: String = "", _ mask: NSEvent.ModifierFlags = [.command]) {
+            let mi = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            if !key.isEmpty { mi.keyEquivalentModifierMask = mask }
+            mi.target = self
+            menu.addItem(mi)
         }
+        add("Capture Screen Area", #selector(captureArea), "4", [.command, .option])
+        add("Show Picture Viewer", #selector(showWindowAction))
+        add("Open…", #selector(openPanel))
+        menu.addItem(.separator())
+        add("Open at Login", #selector(toggleOpenAtLogin))
+        menu.addItem(.separator())
+        add("About Picture Viewer", #selector(showAbout))
+        add("Quit Picture Viewer", #selector(quit), "q")
+        item.menu = menu
+        statusItem = item
+    }
+
+    @objc private func quit() { NSApp.terminate(nil) }
+    @objc private func showWindowAction() { showWindow() }
+
+    /// Dock icon and menu bar come back while the window is up; with no window we go back to the menu bar only.
+    private func showWindow() {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
     }
 
     /// Stay running with no window so the global capture hot key keeps working; quit with ⌘Q.
@@ -1213,7 +1251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         guard !flag else { return true }
-        window.makeKeyAndOrderFront(nil)
+        showWindow()
         return false
     }
 
@@ -1230,6 +1268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.title = "Picture Viewer"
         window.minSize = NSSize(width: 1040, height: 280)
         window.delegate = self
+        window.isReleasedWhenClosed = false     // the window is reused after being closed
         window.center()
         window.setFrameAutosaveName("MainWindow")
 
@@ -1463,7 +1502,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         nextButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14).isActive = true
 
         window.contentView = content
-        window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(canvas)
     }
 
@@ -1511,6 +1549,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         index = files.firstIndex(of: url) ?? 0
         reloadStrip()
         show()
+        showWindow()
     }
 
     private func reloadStrip() {
@@ -1853,6 +1892,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc func showAbout() {
         let built = Bundle.main.object(forInfoDictionaryKey: "PVBuildDate") as? String ?? "unknown"
+        NSApp.activate(ignoringOtherApps: true)     // the panel would stay behind other apps in menu bar mode
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "Picture Viewer",
             .applicationVersion: "Built \(built)",
@@ -1925,6 +1965,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc func toggleCopyCaptures() { copyCaptures.toggle() }
 
+    /// Needs macOS 13+; on 12 the menu item stays disabled.
+    @objc func toggleOpenAtLogin() {
+        guard #available(macOS 13.0, *) else { return }
+        do {
+            if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
+            else { try SMAppService.mainApp.register() }
+        } catch {
+            NSAlert(error: error).runModal()
+        }
+    }
+
     @objc func captureArea() {
         guard !capturing else { return }
         guard CGPreflightScreenCaptureAccess() else {
@@ -1951,8 +2002,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             task.terminationHandler = { _ in
                 DispatchQueue.main.async {
                     self.capturing = false
-                    self.window.makeKeyAndOrderFront(nil)
-                    NSApp.activate(ignoringOtherApps: true)
+                    self.showWindow()
                     // No file means the selection was cancelled (Esc).
                     guard FileManager.default.fileExists(atPath: url.path) else { return }
                     if self.copyCaptures, let img = NSImage(contentsOf: url) {
@@ -1964,7 +2014,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
             do { try task.run() } catch {
                 capturing = false
-                window.makeKeyAndOrderFront(nil)
+                showWindow()
                 NSSound.beep()
             }
         }
@@ -2109,6 +2159,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let pb = NSPasteboard.general
             return NSImage.canInit(with: pb)
                 || pb.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+        case #selector(toggleOpenAtLogin):
+            guard #available(macOS 13.0, *) else { return false }
+            item.state = SMAppService.mainApp.status == .enabled ? .on : .off
+            return true
         case #selector(toggleCopyCaptures):
             item.state = copyCaptures ? .on : .off
             return true
@@ -2155,6 +2209,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         let app = submenu("Picture Viewer")
         add(app, "About Picture Viewer", #selector(showAbout))
+        app.addItem(.separator())
+        add(app, "Open at Login", #selector(toggleOpenAtLogin))
         app.addItem(.separator())
         add(app, "Hide Picture Viewer", #selector(NSApplication.hide(_:)), "h")
         app.addItem(.separator())
@@ -2220,5 +2276,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.regular)
+app.setActivationPolicy(.accessory)   // menu bar only until a window is shown
 app.run()
