@@ -1146,6 +1146,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let strip = ThumbnailStrip()
     private var stripHeight: NSLayoutConstraint!
     private let infoBox = NSStackView()
+    private let toastBox = NSStackView()
+    private let toastLabel = NSTextField(labelWithString: "")
     private let infoLabel = NSTextField(labelWithString: "")
     private var slideshowTimer: Timer?
     private var showStrip = false
@@ -1307,6 +1309,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         content.addSubview(infoBox)
         infoBox.topAnchor.constraint(equalTo: content.topAnchor, constant: 56).isActive = true
         infoBox.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12).isActive = true
+
+        toastLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        toastLabel.textColor = .white
+        toastBox.addArrangedSubview(toastLabel)
+        toastBox.edgeInsets = NSEdgeInsets(top: 10, left: 16, bottom: 10, right: 16)
+        toastBox.wantsLayer = true
+        toastBox.layer?.backgroundColor = NSColor(white: 0, alpha: 0.78).cgColor
+        toastBox.layer?.cornerRadius = 10
+        toastBox.alphaValue = 0
+        toastBox.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(toastBox)
+        toastBox.centerXAnchor.constraint(equalTo: content.centerXAnchor).isActive = true
+        toastBox.bottomAnchor.constraint(equalTo: strip.topAnchor, constant: -24).isActive = true
 
         func tool(_ symbol: String, _ tip: String, _ action: Selector) -> NSButton {
             let b = NSButton()
@@ -1963,6 +1978,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                             GetApplicationEventTarget(), 0, &hotKeyRef)
     }
 
+    private var toastToken = 0
+
+    /// Brief message over the picture that fades out by itself.
+    private func showToast(_ text: String) {
+        toastLabel.stringValue = text
+        toastToken += 1
+        let token = toastToken
+        toastBox.animator().alphaValue = 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            guard let self, self.toastToken == token else { return }
+            NSAnimationContext.runAnimationGroup { $0.duration = 0.4; self.toastBox.animator().alphaValue = 0 }
+        }
+    }
+
     @objc func toggleCopyCaptures() { copyCaptures.toggle() }
 
     /// Needs macOS 13+; on 12 the menu item stays disabled.
@@ -2005,9 +2034,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                     self.showWindow()
                     // No file means the selection was cancelled (Esc).
                     guard FileManager.default.fileExists(atPath: url.path) else { return }
+                    let hadPicture = !self.files.isEmpty
                     if self.copyCaptures, let img = NSImage(contentsOf: url) {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.writeObjects([img])
+                        // A Picture is already open: keep it, so the Capture can be pasted onto it.
+                        if hadPicture {
+                            self.showToast("Capture copied — press ⌘V to paste")
+                            return
+                        }
                     }
                     self.open(url)
                 }

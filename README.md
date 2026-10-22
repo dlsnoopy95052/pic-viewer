@@ -10,7 +10,7 @@ A small native macOS picture viewer with light annotation and editing, written i
 - Browse every picture in the same folder with on-screen arrows or ← / →; drag & drop to open
 - Fit / actual size / zoom / pan
 - Lives in the menu bar: no window or Dock icon until you open or capture a picture; closing the window returns to the menu bar, and ⌘Q quits. Turn on **Open at Login** (menu bar icon or app menu, macOS 13+) to have it ready after sign-in
-- Capture a screen area with the global hot key ⌥⌘4 (works while another app is in front); the capture opens right here to annotate and edit, and is also copied to the clipboard (toggle in the File menu). Needs Screen Recording permission on first use
+- Capture a screen area with the global hot key ⌥⌘4 (works while another app is in front); the capture is copied to the clipboard (toggle in the File menu); if a picture is already open it stays put so you can paste the capture onto it with ⌘V, otherwise the capture opens here to annotate and edit. Needs Screen Recording permission on first use
 - Icon toolbar (top right) for capture, rotate, zoom, fit, slideshow, info, thumbnails, copy, paste, rename, trash
 - Info panel with file / EXIF details, thumbnail strip, slideshow
 - Printing with live preview, paper & orientation selection, shrink-to-fit, fit, actual size, fill, centering
