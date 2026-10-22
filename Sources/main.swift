@@ -1986,7 +1986,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         toastToken += 1
         let token = toastToken
         toastBox.animator().alphaValue = 1
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
             guard let self, self.toastToken == token else { return }
             NSAnimationContext.runAnimationGroup { $0.duration = 0.4; self.toastBox.animator().alphaValue = 0 }
         }
