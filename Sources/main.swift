@@ -4,6 +4,7 @@ import CoreImage
 import ImageIO
 import ServiceManagement
 import UniformTypeIdentifiers
+import Vision
 
 // MARK: - Supported formats
 
@@ -64,7 +65,7 @@ final class ImageCanvas: NSView {
     var cropMode = false {
         didSet {
             cropRect = nil; cropStart = nil; needsDisplay = true
-            if cropMode { tool = .none }
+            if cropMode { tool = .none } else { ocrMode = false }
             window?.invalidateCursorRects(for: self)
             onCropModeChange?()
         }
@@ -75,6 +76,10 @@ final class ImageCanvas: NSView {
     private enum CropDrag { case new, move(NSPoint), handle(Int, Int) }
     private var cropDrag = CropDrag.new
     var onCropApply: (() -> Void)?
+    /// Text recognition: a drag selects the area (no handles) and is handed over on mouse up.
+    /// Set it after turning `cropMode` on.
+    var ocrMode = false
+    var onOcrArea: ((NSRect) -> Void)?
     /// Width / height the crop selection is held to (nil = free).
     var cropAspect: CGFloat?
     var onCropModeChange: (() -> Void)?
@@ -226,7 +231,7 @@ final class ImageCanvas: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        if cropMode, event.keyCode == 36 || event.keyCode == 76 {
+        if cropMode, !ocrMode, event.keyCode == 36 || event.keyCode == 76 {
             onCropApply?()
         } else if event.keyCode == 53 {
             onEscape?()
@@ -355,7 +360,7 @@ final class ImageCanvas: NSView {
                 b.lineWidth = 1
                 b.setLineDash([5, 3], count: 2, phase: 0)
                 b.stroke()
-                for h in cropHandles(r) {
+                for h in cropHandles(r) where !ocrMode {
                     let hr = NSRect(x: h.point.x - 4, y: h.point.y - 4, width: 8, height: 8)
                     NSColor.white.setFill(); NSBezierPath(rect: hr).fill()
                     NSColor.controlAccentColor.setStroke(); NSBezierPath(rect: hr).stroke()
@@ -423,6 +428,10 @@ final class ImageCanvas: NSView {
     override func mouseUp(with event: NSEvent) {
         drag = .none
         dragStarted = false
+        if cropMode, ocrMode, let r = cropRectInImage {
+            onOcrArea?(r)
+            return
+        }
         guard tool != .none, drawPoints.count >= 2, let image else { drawPoints = []; return }
         let shape = Annotation(tool: tool, points: drawPoints,
                                width: annotationWidth * ImageEdit.strokeScale(image.size),
@@ -536,9 +545,9 @@ final class ImageCanvas: NSView {
         if cropMode {
             let ir = imageRect
             let s = convert(event.locationInWindow, from: nil)
-            if let h = cropHandle(at: s) {
+            if !ocrMode, let h = cropHandle(at: s) {
                 cropDrag = .handle(h.hx, h.hy)
-            } else if let r = cropRect, r.contains(s) {
+            } else if !ocrMode, let r = cropRect, r.contains(s) {
                 cropDrag = .move(NSPoint(x: s.x - r.minX, y: s.y - r.minY))
             } else {
                 cropDrag = .new
@@ -1419,6 +1428,7 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
     private var adjustButton: NSButton!
     private var rotateAnyButton: NSButton!
     private var expandButton: NSButton!
+    private var ocrButton: NSButton!
     private var cropShapeButton: NSButton!
     private var cropShape = "Free"
     private var cropCustomSize: NSSize?
@@ -1592,6 +1602,7 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
             b.heightAnchor.constraint(equalToConstant: 28).isActive = true
             return b
         }
+        ocrButton = tool("text.viewfinder", "Recognize text: drag an area of the picture, the text is copied (⇧⌘T)", #selector(ocrAction))
         slideshowButton = tool("play.fill", "Start slideshow (Space)", #selector(toggleSlideshow))
         infoButton = tool("info.circle", "Show info (I)", #selector(toggleInfo))
         thumbsButton = tool("square.grid.3x1.below.line.grid.1x2", "Show thumbnails (T)", #selector(toggleThumbnails))
@@ -1606,6 +1617,7 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
             slideshowButton, infoButton, thumbsButton,
             tool("doc.on.doc", "Copy image (⌘C)", #selector(copyImage)),
             tool("doc.on.clipboard", "Paste picture (⌘V)", #selector(pasteImage)),
+            ocrButton,
             tool("pencil", "Rename (⌘E)", #selector(renameFile)),
             tool("trash", "Move to Trash (⌘⌫)", #selector(moveToTrash)),
             tool("xmark.circle", "Close picture (⇧⌘W)", #selector(closePicture)),
@@ -1647,9 +1659,12 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
         editBar.topAnchor.constraint(equalTo: toolbar.topAnchor).isActive = true
         editBar.trailingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: -8).isActive = true
         canvas.onCropApply = { [weak self] in self?.cropAction() }
+        canvas.onOcrArea = { [weak self] r in self?.recognizeText(in: r) }
         canvas.onCropModeChange = { [weak self] in
             guard let self else { return }
-            self.cropButton.contentTintColor = self.canvas.cropMode
+            self.cropButton.contentTintColor = self.canvas.cropMode && !self.canvas.ocrMode
+                ? .controlAccentColor : NSColor(white: 1, alpha: 0.85)
+            self.ocrButton.contentTintColor = self.canvas.ocrMode
                 ? .controlAccentColor : NSColor(white: 1, alpha: 0.85)
         }
         canvas.onEscape = { [weak self] in
@@ -1964,6 +1979,51 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
             applyEdit(out)
         } else {
             canvas.cropMode = false
+        }
+    }
+
+    /// Drag an area of the open picture; its text is recognized and copied.
+    @objc func ocrAction() {
+        guard currentImage != nil else { NSSound.beep(); return }
+        if canvas.ocrMode { canvas.cropMode = false; return }
+        bakeRotation()
+        canvas.tool = .none
+        canvas.cropMode = false
+        canvas.cropAspect = nil
+        canvas.cropMode = true
+        canvas.ocrMode = true
+        canvas.onCropModeChange?()
+        showToast("Drag an area to recognize its text (Esc cancels)")
+    }
+
+    private func recognizeText(in rect: NSRect) {
+        canvas.cropMode = false
+        guard let img = currentImage, let piece = ImageEdit.crop(img, to: rect),
+              let cg = ImageEdit.cgImage(piece) else { NSSound.beep(); return }
+        showToast("Recognizing text…")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
+            if #available(macOS 13.0, *) {
+                request.automaticallyDetectsLanguage = true
+                request.recognitionLanguages = ["zh-Hant", "zh-Hans", "en-US", "ja-JP", "ko-KR"]
+            }
+            var failure: Error?
+            do { try VNImageRequestHandler(cgImage: cg, options: [:]).perform([request]) } catch { failure = error }
+            let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+            DispatchQueue.main.async { [self] in
+                if let failure {
+                    showToast("Text recognition failed: \(failure.localizedDescription)")
+                    return
+                }
+                let text = lines.joined(separator: "\n")
+                guard !text.isEmpty else { showToast("No text found in that area"); return }
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+                let preview = lines[0].count > 60 ? String(lines[0].prefix(60)) + "…" : lines[0]
+                showToast("Copied \(text.count) characters: \(preview)")
+            }
         }
     }
 
@@ -2752,7 +2812,7 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
              #selector(zoomIn), #selector(zoomOut), #selector(rotateLeft), #selector(rotateRight),
              #selector(copyImage), #selector(flipHorizontal), #selector(flipVertical),
              #selector(cropAction), #selector(showAdjust), #selector(saveImage), #selector(saveCopy),
-             #selector(showRotateAny), #selector(showExpand):
+             #selector(showRotateAny), #selector(showExpand), #selector(ocrAction):
             return currentImage != nil
         case #selector(closePicture):
             return !files.isEmpty
@@ -2817,6 +2877,7 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
         add(edit, "Copy", #selector(copyImage), "c")
         add(edit, "Paste", #selector(pasteImage), "v")
         edit.addItem(.separator())
+        add(edit, "Recognize Text (OCR)", #selector(ocrAction), "t", [.command, .shift])
         add(edit, "Crop", #selector(cropAction), "k")
         add(edit, "Flip Horizontally", #selector(flipHorizontal))
         add(edit, "Flip Vertically", #selector(flipVertical))

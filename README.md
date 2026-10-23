@@ -11,6 +11,7 @@ A small native macOS picture viewer with light annotation and editing, written i
 - Fit / actual size / zoom / pan
 - Lives in the menu bar: no window or Dock icon until you open or capture a picture; closing the window returns to the menu bar, and ⌘Q quits. Turn on **Open at Login** (menu bar icon or app menu, macOS 13+) to have it ready after sign-in
 - Capture a screen area with the global hot key ⌥⌘4 (works while another app is in front; change it with **Set Capture Hot Key…** in the menu bar or File menu); the capture is copied to the clipboard (toggle in the File menu); if a picture is already open it stays put so you can paste the capture onto it with ⌘V, otherwise the capture opens here to annotate and edit. Needs Screen Recording permission on first use
+- **Recognize text (OCR)**: click the text button (⇧⌘T, or Edit → Recognize Text), drag an area of the open picture, and the text in it is copied to the clipboard with a short preview. Uses macOS's built-in Vision, so it works offline; it reads Traditional / Simplified Chinese, English, Japanese and Korean. Esc cancels
 - Icon toolbar (top right) for capture, rotate, zoom, fit, slideshow, info, thumbnails, copy, paste, rename, trash
 - Info panel with file / EXIF details, thumbnail strip, slideshow
 - Printing with live preview, paper & orientation selection, shrink-to-fit, fit, actual size, fill, centering
@@ -51,6 +52,7 @@ Editing changes the picture's pixels, so it flattens any annotations first.
 | Undo | ⌘Z |
 | Copy / Paste | ⌘C / ⌘V |
 | Crop | ⌘K |
+| Recognize text (OCR) | ⇧⌘T |
 | Previous / next picture | ← / → |
 | First / last picture | Home / End |
 | Fit to window / actual size | ⌘0 / ⌘1 |
