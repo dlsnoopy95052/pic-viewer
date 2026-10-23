@@ -87,6 +87,8 @@ Otherwise the app is ad-hoc signed: privacy permissions may reset on every rebui
 | `build.sh` | Builds, bundles, signs and optionally installs the app |
 | `Resources/AppIcon.icns` | App icon |
 | `tools/make-icon.swift` | Script that generates the app icon |
+| `Resources/AppIcon-source.png` | Source artwork for the app icon |
+| `tools/icon-from-png.swift` | Script that turns artwork on a plain background into the 1024 px app icon (rounded cut-out, shadow); `iconutil` then makes `AppIcon.icns` |
 | `GLOSSARY.md` | Domain terms (Picture, Annotation, Mosaic, Pasted layer, Flatten, View rotation, Annotate, Edit) |
 | `docs/agents/` | Issue tracker, triage labels and domain-doc setup for coding agents |
 
