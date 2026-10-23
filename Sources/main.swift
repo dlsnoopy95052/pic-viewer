@@ -1265,7 +1265,6 @@ final class RotateController: NSViewController {
         slider.action = #selector(sliderMoved)
         slider.numberOfTickMarks = 19
         slider.allowsTickMarkValuesOnly = false
-        slider.widthAnchor.constraint(equalToConstant: 240).isActive = true
         field.target = self
         field.action = #selector(fieldEdited)
         field.alignment = .right
@@ -1277,17 +1276,29 @@ final class RotateController: NSViewController {
         apply.keyEquivalent = "\r"
         let top = NSStackView(views: [NSTextField(labelWithString: "Angle"), field, NSTextField(labelWithString: "°"), minus, plus])
         top.spacing = 6
-        let hint = NSTextField(labelWithString: "Clockwise is positive. Empty corners are transparent; crop afterwards.")
+        let hint = NSTextField(wrappingLabelWithString: "Clockwise is positive. Empty corners are transparent; crop afterwards.")
         hint.font = .systemFont(ofSize: 10)
         hint.textColor = .secondaryLabelColor
+        hint.preferredMaxLayoutWidth = 260
         let buttons = NSStackView(views: [reset, apply])
         let stack = NSStackView(views: [top, slider, hint, buttons])
         stack.orientation = .vertical
-        stack.alignment = .trailing
-        stack.spacing = 10
-        stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
-        stack.frame.size = stack.fittingSize
-        view = stack
+        stack.alignment = .leading
+        stack.spacing = 12
+        buttons.translatesAutoresizingMaskIntoConstraints = false
+        slider.widthAnchor.constraint(equalToConstant: 260).isActive = true
+        let container = NSView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 18),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -18),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 18),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -18),
+            buttons.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+        ])
+        container.frame.size = container.fittingSize
+        view = container
     }
 
     private func set(_ value: Double) {
@@ -1326,11 +1337,20 @@ final class ExpandController: NSViewController {
         let stack = NSStackView(views: [row("Left", fields[0]), row("Top", fields[1]),
                                         row("Right", fields[2]), row("Bottom", fields[3]), fillRow, apply])
         stack.orientation = .vertical
-        stack.alignment = .trailing
-        stack.spacing = 8
-        stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
-        stack.frame.size = stack.fittingSize
-        view = stack
+        stack.alignment = .leading
+        stack.spacing = 10
+        let container = NSView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 18),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -18),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 18),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -18),
+            apply.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+        ])
+        container.frame.size = container.fittingSize
+        view = container
     }
 
     @objc private func applyTapped() {
@@ -1761,6 +1781,19 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
 
         window.contentView = content
         window.makeFirstResponder(canvas)
+
+        // The three bars sit in one row, so the window must never be narrower than they are together.
+        content.layoutSubtreeIfNeeded()
+        var barsWidth: CGFloat = 8 + 8 + 12 + 12
+        barsWidth += toolbar.fittingSize.width
+        barsWidth += editBar.fittingSize.width
+        barsWidth += annotBar.fittingSize.width
+        window.contentMinSize = NSSize(width: max(1040, ceil(barsWidth)), height: 280)
+        if window.contentLayoutRect.width < window.contentMinSize.width {
+            var f = window.frame
+            f.size.width += window.contentMinSize.width - window.contentLayoutRect.width
+            window.setFrame(f, display: false)
+        }
     }
 
     private func configure(_ button: NSButton, symbol: String, action: Selector) {
