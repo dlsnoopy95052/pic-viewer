@@ -71,6 +71,12 @@ final class ImageCanvas: NSView {
     }
     private(set) var cropRect: NSRect?
     private var cropStart: NSPoint?
+    /// In-progress crop gesture: a new selection, moving it, or dragging a handle (hx, hy in -1…1).
+    private enum CropDrag { case new, move(NSPoint), handle(Int, Int) }
+    private var cropDrag = CropDrag.new
+    var onCropApply: (() -> Void)?
+    /// Width / height the crop selection is held to (nil = free).
+    var cropAspect: CGFloat?
     var onCropModeChange: (() -> Void)?
     var onEscape: (() -> Void)?
 
@@ -183,8 +189,46 @@ final class ImageCanvas: NSView {
                       width: r.width * kx, height: r.height * ky)
     }
 
+    /// Selection from a fixed `anchor` corner to the pointer `p`, held to `cropAspect` and inside the picture.
+    private func cropRect(from anchor: NSPoint, to p: NSPoint) -> NSRect {
+        let ir = imageRect
+        let dx = p.x - anchor.x, dy = p.y - anchor.y
+        guard let a = cropAspect, a > 0 else {
+            return NSRect(x: min(anchor.x, p.x), y: min(anchor.y, p.y), width: abs(dx), height: abs(dy)).intersection(ir)
+        }
+        var w = abs(dx), h = abs(dy)
+        if h == 0 || w / h > a { w = h * a } else { h = w / a }
+        // Shrink to stay inside the picture in the direction of the drag.
+        let availW = dx >= 0 ? ir.maxX - anchor.x : anchor.x - ir.minX
+        let availH = dy >= 0 ? ir.maxY - anchor.y : anchor.y - ir.minY
+        if w > 0, h > 0 {
+            let s = min(1, availW / w, availH / h)
+            w *= s; h *= s
+        }
+        return NSRect(x: dx >= 0 ? anchor.x : anchor.x - w, y: dy >= 0 ? anchor.y : anchor.y - h, width: w, height: h)
+    }
+
+    /// Handles of the selection; with a fixed shape only the corners can be dragged.
+    private func cropHandles(_ r: NSRect) -> [(hx: Int, hy: Int, point: NSPoint)] {
+        var out: [(Int, Int, NSPoint)] = []
+        for hy in -1...1 { for hx in -1...1 where !(hx == 0 && hy == 0) {
+            if cropAspect != nil && (hx == 0 || hy == 0) { continue }
+            out.append((hx, hy, NSPoint(x: hx < 0 ? r.minX : hx > 0 ? r.maxX : r.midX,
+                                        y: hy < 0 ? r.minY : hy > 0 ? r.maxY : r.midY)))
+        } }
+        return out
+    }
+
+    private func cropHandle(at p: NSPoint) -> (hx: Int, hy: Int)? {
+        guard let r = cropRect else { return nil }
+        for h in cropHandles(r) where hypot(h.point.x - p.x, h.point.y - p.y) <= 8 { return (h.hx, h.hy) }
+        return nil
+    }
+
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 {
+        if cropMode, event.keyCode == 36 || event.keyCode == 76 {
+            onCropApply?()
+        } else if event.keyCode == 53 {
             onEscape?()
         } else if event.keyCode == 51 || event.keyCode == 117, let i = selected, annotations.indices.contains(i) {
             onBeginChange?()
@@ -311,6 +355,11 @@ final class ImageCanvas: NSView {
                 b.lineWidth = 1
                 b.setLineDash([5, 3], count: 2, phase: 0)
                 b.stroke()
+                for h in cropHandles(r) {
+                    let hr = NSRect(x: h.point.x - 4, y: h.point.y - 4, width: 8, height: 8)
+                    NSColor.white.setFill(); NSBezierPath(rect: hr).fill()
+                    NSColor.controlAccentColor.setStroke(); NSBezierPath(rect: hr).stroke()
+                }
             }
         }
 
@@ -442,11 +491,33 @@ final class ImageCanvas: NSView {
             case .none: break
             }
         }
-        if cropMode, let start = cropStart {
-            let p = convert(event.locationInWindow, from: nil)
-            cropRect = NSRect(x: min(start.x, p.x), y: min(start.y, p.y),
-                              width: abs(p.x - start.x), height: abs(p.y - start.y))
-                .intersection(imageRect)
+        if cropMode {
+            let ir = imageRect
+            let raw = convert(event.locationInWindow, from: nil)
+            let p = NSPoint(x: min(max(raw.x, ir.minX), ir.maxX), y: min(max(raw.y, ir.minY), ir.maxY))
+            switch cropDrag {
+            case .new:
+                if let start = cropStart { cropRect = cropRect(from: start, to: p) }
+            case .move(let grab):
+                if let r = cropRect {
+                    var o = NSPoint(x: p.x - grab.x, y: p.y - grab.y)
+                    o.x = min(max(o.x, ir.minX), ir.maxX - r.width)
+                    o.y = min(max(o.y, ir.minY), ir.maxY - r.height)
+                    cropRect = NSRect(origin: o, size: r.size)
+                }
+            case .handle(let hx, let hy):
+                guard let r = cropRect else { return }
+                if hx != 0 && hy != 0 {
+                    let anchor = NSPoint(x: hx < 0 ? r.maxX : r.minX, y: hy < 0 ? r.maxY : r.minY)
+                    cropRect = cropRect(from: anchor, to: p)
+                } else {
+                    var minX = r.minX, maxX = r.maxX, minY = r.minY, maxY = r.maxY
+                    if hx < 0 { minX = p.x } else if hx > 0 { maxX = p.x }
+                    if hy < 0 { minY = p.y } else if hy > 0 { maxY = p.y }
+                    cropRect = NSRect(x: min(minX, maxX), y: min(minY, maxY),
+                                      width: abs(maxX - minX), height: abs(maxY - minY))
+                }
+            }
             needsDisplay = true
             return
         }
@@ -463,8 +534,17 @@ final class ImageCanvas: NSView {
             return
         }
         if cropMode {
-            cropStart = convert(event.locationInWindow, from: nil)
-            cropRect = nil
+            let ir = imageRect
+            let s = convert(event.locationInWindow, from: nil)
+            if let h = cropHandle(at: s) {
+                cropDrag = .handle(h.hx, h.hy)
+            } else if let r = cropRect, r.contains(s) {
+                cropDrag = .move(NSPoint(x: s.x - r.minX, y: s.y - r.minY))
+            } else {
+                cropDrag = .new
+                cropStart = NSPoint(x: min(max(s.x, ir.minX), ir.maxX), y: min(max(s.y, ir.minY), ir.maxY))
+                cropRect = nil
+            }
             needsDisplay = true
             return
         }
@@ -932,6 +1012,52 @@ enum ImageEdit {
         return NSImage(cgImage: out, size: NSSize(width: CGFloat(out.width) / k, height: CGFloat(out.height) / k))
     }
 
+    /// Scales to exactly `pixels` (used for a Custom crop size).
+    static func resize(_ image: NSImage, toPixels pixels: NSSize) -> NSImage? {
+        guard let cg = cgImage(image), image.size.width > 0 else { return nil }
+        let k = CGFloat(cg.width) / image.size.width
+        let w = max(1, Int(pixels.width.rounded())), h = max(1, Int(pixels.height.rounded()))
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let out = ctx.makeImage() else { return nil }
+        return NSImage(cgImage: out, size: NSSize(width: CGFloat(w) / k, height: CGFloat(h) / k))
+    }
+
+    /// Size of the canvas that holds `size` rotated by `degrees`.
+    static func rotatedSize(_ size: NSSize, degrees: Double) -> NSSize {
+        let a = CGFloat(degrees) * .pi / 180
+        let c = abs(cos(a)), s = abs(sin(a))
+        return NSSize(width: size.width * c + size.height * s, height: size.width * s + size.height * c)
+    }
+
+    /// Rotates by any angle, clockwise for positive `degrees`. The whole picture is kept;
+    /// the empty corners are transparent.
+    static func rotate(_ image: NSImage, degrees: Double) -> NSImage? {
+        guard degrees != 0 else { return image }
+        let out = rotatedSize(image.size, degrees: degrees)
+        return rasterize(image, outSize: out) { ctx, s, o, cg in
+            ctx.translateBy(x: o.width / 2, y: o.height / 2)
+            ctx.rotate(by: -CGFloat(degrees) * .pi / 180)
+            ctx.draw(cg, in: CGRect(x: -s.width / 2, y: -s.height / 2, width: s.width, height: s.height))
+        }
+    }
+
+    /// Adds space around the picture (image points), filled with `fill` (nil = transparent).
+    static func expand(_ image: NSImage, left: CGFloat, top: CGFloat, right: CGFloat, bottom: CGFloat,
+                       fill: NSColor?) -> NSImage? {
+        let out = NSSize(width: image.size.width + left + right, height: image.size.height + top + bottom)
+        return rasterize(image, outSize: out) { ctx, s, o, cg in
+            if let fill {
+                ctx.setFillColor(fill.cgColor)
+                ctx.fill(CGRect(origin: .zero, size: o))
+            }
+            ctx.draw(cg, in: CGRect(x: left, y: bottom, width: s.width, height: s.height))
+        }
+    }
+
     static func adjust(_ image: NSImage, brightness: Double, contrast: Double, saturation: Double) -> NSImage? {
         guard let cg = cgImage(image), let f = CIFilter(name: "CIColorControls") else { return nil }
         f.setValue(CIImage(cgImage: cg), forKey: kCIInputImageKey)
@@ -1125,7 +1251,97 @@ final class PrintOptionsController: NSViewController, NSPrintPanelAccessorizing 
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation, NSPopoverDelegate {
+/// Popover content: rotate by any angle (-45° … +45°) with live preview.
+final class RotateController: NSViewController {
+    var onChange: ((Double) -> Void)?
+    var onApply: ((Double) -> Void)?
+    private let slider = NSSlider(value: 0, minValue: -45, maxValue: 45, target: nil, action: nil)
+    private let field = NSTextField(string: "0.0")
+
+    private var degrees: Double { (slider.doubleValue * 10).rounded() / 10 }
+
+    override func loadView() {
+        slider.target = self
+        slider.action = #selector(sliderMoved)
+        slider.numberOfTickMarks = 19
+        slider.allowsTickMarkValuesOnly = false
+        slider.widthAnchor.constraint(equalToConstant: 240).isActive = true
+        field.target = self
+        field.action = #selector(fieldEdited)
+        field.alignment = .right
+        field.widthAnchor.constraint(equalToConstant: 56).isActive = true
+        let minus = NSButton(title: "−0.1°", target: self, action: #selector(nudgeDown))
+        let plus = NSButton(title: "+0.1°", target: self, action: #selector(nudgeUp))
+        let reset = NSButton(title: "Reset", target: self, action: #selector(resetValue))
+        let apply = NSButton(title: "Apply", target: self, action: #selector(apply))
+        apply.keyEquivalent = "\r"
+        let top = NSStackView(views: [NSTextField(labelWithString: "Angle"), field, NSTextField(labelWithString: "°"), minus, plus])
+        top.spacing = 6
+        let hint = NSTextField(labelWithString: "Clockwise is positive. Empty corners are transparent; crop afterwards.")
+        hint.font = .systemFont(ofSize: 10)
+        hint.textColor = .secondaryLabelColor
+        let buttons = NSStackView(views: [reset, apply])
+        let stack = NSStackView(views: [top, slider, hint, buttons])
+        stack.orientation = .vertical
+        stack.alignment = .trailing
+        stack.spacing = 10
+        stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+        stack.frame.size = stack.fittingSize
+        view = stack
+    }
+
+    private func set(_ value: Double) {
+        let v = min(45, max(-45, (value * 10).rounded() / 10))
+        slider.doubleValue = v
+        field.stringValue = String(format: "%.1f", v)
+        onChange?(v)
+    }
+
+    @objc private func sliderMoved() { set(slider.doubleValue) }
+    @objc private func fieldEdited() { set(field.doubleValue) }
+    @objc private func nudgeDown() { set(degrees - 0.1) }
+    @objc private func nudgeUp() { set(degrees + 0.1) }
+    @objc private func resetValue() { set(0) }
+    @objc private func apply() { onApply?(degrees) }
+}
+
+/// Popover content: add space on any side.
+final class ExpandController: NSViewController {
+    var onApply: ((_ left: CGFloat, _ top: CGFloat, _ right: CGFloat, _ bottom: CGFloat, _ fill: NSColor?) -> Void)?
+    private let fields = (0..<4).map { _ in NSTextField(string: "0") }
+    private let fillPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+
+    override func loadView() {
+        func row(_ title: String, _ f: NSTextField) -> NSStackView {
+            f.alignment = .right
+            f.widthAnchor.constraint(equalToConstant: 70).isActive = true
+            let label = NSTextField(labelWithString: title)
+            label.widthAnchor.constraint(equalToConstant: 50).isActive = true
+            return NSStackView(views: [label, f, NSTextField(labelWithString: "px")])
+        }
+        fillPopup.addItems(withTitles: ["White", "Black", "Transparent"])
+        let fillRow = NSStackView(views: [NSTextField(labelWithString: "Fill"), fillPopup])
+        let apply = NSButton(title: "Apply", target: self, action: #selector(applyTapped))
+        apply.keyEquivalent = "\r"
+        let stack = NSStackView(views: [row("Left", fields[0]), row("Top", fields[1]),
+                                        row("Right", fields[2]), row("Bottom", fields[3]), fillRow, apply])
+        stack.orientation = .vertical
+        stack.alignment = .trailing
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+        stack.frame.size = stack.fittingSize
+        view = stack
+    }
+
+    @objc private func applyTapped() {
+        let v = fields.map { max(0, CGFloat($0.doubleValue)) }
+        guard v.contains(where: { $0 > 0 }) else { return }
+        let fill: NSColor? = [NSColor.white, NSColor.black, nil][max(0, fillPopup.indexOfSelectedItem)]
+        onApply?(v[0], v[1], v[2], v[3], fill)
+    }
+}
+
+final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation, NSPopoverDelegate {
     private var window: NSWindow!
     private let canvas = ImageCanvas()
     private let prevButton = NSButton()
@@ -1169,6 +1385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let italicButton = NSButton()
     private var capturing = false
     private var hotKeyRef: EventHotKeyRef?
+    private var captureButton: NSButton?
     private var copyCaptures: Bool {
         get { UserDefaults.standard.bool(forKey: "copyCaptures") }
         set { UserDefaults.standard.set(newValue, forKey: "copyCaptures") }
@@ -1180,6 +1397,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var adjustApplied = false
     private var adjustPopover: NSPopover?
     private var adjustButton: NSButton!
+    private var rotateAnyButton: NSButton!
+    private var expandButton: NSButton!
+    private var cropShapeButton: NSButton!
+    private var cropShape = "Free"
+    private var cropCustomSize: NSSize?
     private var slideshowButton: NSButton!
     private var infoButton: NSButton!
     private var thumbsButton: NSButton!
@@ -1225,6 +1447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         add("Capture Screen Area", #selector(captureArea), "4", [.command, .option])
         add("Show Picture Viewer", #selector(showWindowAction))
         add("Open…", #selector(openPanel))
+        add("Set Capture Hot Key…", #selector(setCaptureHotKey))
         menu.addItem(.separator())
         add("Open at Login", #selector(toggleOpenAtLogin))
         menu.addItem(.separator())
@@ -1232,6 +1455,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         add("Quit Picture Viewer", #selector(quit), "q")
         item.menu = menu
         statusItem = item
+        applyHotKeyToMenus()
+        if hotKeyTaken {
+            hotKeyTaken = false
+            DispatchQueue.main.async {
+                NSApp.activate(ignoringOtherApps: true)
+                let a = NSAlert()
+                a.messageText = "Capture hot key unavailable"
+                a.informativeText = "Your saved combination is used by another program, so ⌥⌘4 is active instead. Change it with Set Capture Hot Key…"
+                a.runModal()
+            }
+        }
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
@@ -1341,8 +1575,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         slideshowButton = tool("play.fill", "Start slideshow (Space)", #selector(toggleSlideshow))
         infoButton = tool("info.circle", "Show info (I)", #selector(toggleInfo))
         thumbsButton = tool("square.grid.3x1.below.line.grid.1x2", "Show thumbnails (T)", #selector(toggleThumbnails))
+        captureButton = tool("camera.viewfinder", "Capture a screen area", #selector(captureArea))
         toolbar.setViews([
-            tool("camera.viewfinder", "Capture a screen area (⌥⌘4)", #selector(captureArea)),
+            captureButton!,
             tool("rotate.left", "Rotate left (⌘[)", #selector(rotateLeft)),
             tool("rotate.right", "Rotate right (⌘])", #selector(rotateRight)),
             tool("minus.magnifyingglass", "Zoom out (⌘-)", #selector(zoomOut)),
@@ -1353,6 +1588,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             tool("doc.on.clipboard", "Paste picture (⌘V)", #selector(pasteImage)),
             tool("pencil", "Rename (⌘E)", #selector(renameFile)),
             tool("trash", "Move to Trash (⌘⌫)", #selector(moveToTrash)),
+            tool("xmark.circle", "Close picture (⇧⌘W)", #selector(closePicture)),
         ], in: .leading)
         toolbar.spacing = 2
         toolbar.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
@@ -1366,8 +1602,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         cropButton = tool("crop", "Crop: drag a region, then click again to apply (⌘K)", #selector(cropAction))
         adjustButton = tool("slider.horizontal.3", "Adjust brightness / contrast / saturation", #selector(showAdjust))
+        cropShapeButton = tool("aspectratio", "Crop shape: free, ratio or custom size", #selector(showCropShapes))
+        rotateAnyButton = tool("angle", "Rotate by any angle", #selector(showRotateAny))
+        expandButton = tool("arrow.up.left.and.down.right.and.arrow.up.right.and.down.left", "Expand canvas", #selector(showExpand))
         editBar.setViews([
             cropButton,
+            cropShapeButton,
+            rotateAnyButton,
+            expandButton,
             tool("arrow.left.and.right.righttriangle.left.righttriangle.right", "Flip horizontally", #selector(flipHorizontal)),
             tool("arrow.up.and.down.righttriangle.up.righttriangle.down", "Flip vertically", #selector(flipVertical)),
             adjustButton,
@@ -1384,6 +1626,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         content.addSubview(editBar)
         editBar.topAnchor.constraint(equalTo: toolbar.topAnchor).isActive = true
         editBar.trailingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: -8).isActive = true
+        canvas.onCropApply = { [weak self] in self?.cropAction() }
         canvas.onCropModeChange = { [weak self] in
             guard let self else { return }
             self.cropButton.contentTintColor = self.canvas.cropMode
@@ -1682,12 +1925,155 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if !canvas.cropMode {
             flatten()
             canvas.cropMode = true
-        } else if let r = canvas.cropRectInImage, let img = currentImage, let out = ImageEdit.crop(img, to: r) {
+        } else if let r = canvas.cropRectInImage, let img = currentImage, var out = ImageEdit.crop(img, to: r) {
             canvas.cropMode = false
+            if let size = cropCustomSize, let scaled = ImageEdit.resize(out, toPixels: size) { out = scaled }
             applyEdit(out)
         } else {
             canvas.cropMode = false
         }
+    }
+
+    @objc func showCropShapes() {
+        guard currentImage != nil else { NSSound.beep(); return }
+        let menu = NSMenu()
+        for name in ["Free", "Original", "1:1", "4:3", "3:2", "16:9", "5:4"] {
+            let item = menu.addItem(withTitle: name, action: #selector(pickCropShape(_:)), keyEquivalent: "")
+            item.target = self
+            item.state = cropShape == name ? .on : .off
+        }
+        menu.addItem(.separator())
+        let swap = menu.addItem(withTitle: "Swap Landscape / Portrait", action: #selector(swapCropShape), keyEquivalent: "")
+        swap.target = self
+        swap.isEnabled = canvas.cropAspect != nil && cropCustomSize == nil
+        let custom = menu.addItem(withTitle: "Custom Size…", action: #selector(pickCustomCropSize), keyEquivalent: "")
+        custom.target = self
+        custom.state = cropShape == "Custom" ? .on : .off
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: cropShapeButton.bounds.height + 4), in: cropShapeButton)
+    }
+
+    @objc private func pickCropShape(_ sender: NSMenuItem) {
+        guard let img = currentImage else { return }
+        cropShape = sender.title
+        cropCustomSize = nil
+        switch sender.title {
+        case "Free": canvas.cropAspect = nil
+        case "Original": canvas.cropAspect = img.size.width / img.size.height
+        default:
+            let parts = sender.title.split(separator: ":").compactMap { Double($0) }
+            canvas.cropAspect = parts.count == 2 ? CGFloat(parts[0] / parts[1]) : nil
+        }
+        startCropIfNeeded()
+    }
+
+    @objc private func swapCropShape() {
+        guard let a = canvas.cropAspect, a > 0 else { return }
+        canvas.cropAspect = 1 / a
+        startCropIfNeeded()
+    }
+
+    @objc private func pickCustomCropSize() {
+        let alert = NSAlert()
+        alert.messageText = "Custom crop size"
+        alert.informativeText = "The crop is scaled to exactly this size in pixels."
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        let w = NSTextField(string: cropCustomSize.map { String(Int($0.width)) } ?? "1280")
+        let h = NSTextField(string: cropCustomSize.map { String(Int($0.height)) } ?? "720")
+        for f in [w, h] { f.alignment = .right; f.widthAnchor.constraint(equalToConstant: 80).isActive = true }
+        let row = NSStackView(views: [w, NSTextField(labelWithString: "×"), h, NSTextField(labelWithString: "px")])
+        row.spacing = 6
+        row.frame.size = row.fittingSize
+        alert.accessoryView = row
+        alert.window.initialFirstResponder = w
+        guard alert.runModal() == .alertFirstButtonReturn, w.doubleValue >= 1, h.doubleValue >= 1 else { return }
+        let size = NSSize(width: min(20000, w.doubleValue.rounded()), height: min(20000, h.doubleValue.rounded()))
+        cropShape = "Custom"
+        cropCustomSize = size
+        canvas.cropAspect = size.width / size.height
+        startCropIfNeeded()
+    }
+
+    /// Choosing a shape starts a fresh selection.
+    private func startCropIfNeeded() {
+        flatten()
+        canvas.cropMode = false
+        canvas.cropMode = true
+    }
+
+    @objc func showRotateAny() {
+        guard currentImage != nil else { NSSound.beep(); return }
+        canvas.cropMode = false
+        canvas.tool = .none
+        flatten()
+        guard let base = currentImage else { return }
+        adjustBase = base
+        adjustApplied = false
+        let controller = RotateController()
+        controller.onChange = { [weak self] deg in
+            guard let self, let base = self.adjustBase, let out = ImageEdit.rotate(base, degrees: deg) else { return }
+            self.canvas.replaceImage(out)
+        }
+        controller.onApply = { [weak self] deg in
+            guard let self, let base = self.adjustBase else { return }
+            self.adjustApplied = true
+            self.adjustPopover?.close()
+            if deg != 0, let out = ImageEdit.rotate(base, degrees: deg) { self.applyEdit(out, keepView: true) }
+            else if let cur = self.currentImage { self.canvas.replaceImage(cur) }
+        }
+        presentPopover(controller, from: rotateAnyButton)
+    }
+
+    @objc func showExpand() {
+        guard currentImage != nil else { NSSound.beep(); return }
+        canvas.cropMode = false
+        canvas.tool = .none
+        flatten()
+        guard currentImage != nil else { return }
+        adjustApplied = false
+        adjustBase = currentImage
+        let controller = ExpandController()
+        controller.onApply = { [weak self] l, t, r, b, fill in
+            guard let self, let base = self.currentImage else { return }
+            self.adjustApplied = true
+            self.adjustPopover?.close()
+            if let out = ImageEdit.expand(base, left: l, top: t, right: r, bottom: b, fill: fill) {
+                self.applyEdit(out)
+            }
+        }
+        presentPopover(controller, from: expandButton)
+    }
+
+    private func presentPopover(_ controller: NSViewController, from button: NSButton) {
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = controller
+        popover.delegate = self
+        adjustPopover = popover
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .maxY)
+    }
+
+    /// Empty the viewer. A Capture then opens on its own instead of waiting to be pasted.
+    @objc func closePicture() {
+        guard !files.isEmpty, confirmDiscard() else { return }
+        if slideshowTimer != nil { toggleSlideshow() }
+        files = []
+        index = 0
+        currentImage = nil
+        canvas.cropMode = false
+        canvas.tool = .none
+        canvas.image = nil
+        undoStack = []
+        edited = false
+        window.representedURL = nil
+        window.title = "Picture Viewer"
+        window.isDocumentEdited = false
+        prevButton.isEnabled = false
+        nextButton.isEnabled = false
+        prevButton.alphaValue = 0.25
+        nextButton.alphaValue = 0.25
+        reloadStrip()
+        infoLabel.stringValue = ""
     }
 
     @objc func selectTool(_ sender: NSButton) {
@@ -1966,17 +2352,137 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         canvas.selected = canvas.annotations.count - 1
     }
 
-    /// Global ⌥⌘4, works while another app is in front (Carbon hot keys need no extra permission).
+    private struct HotKey {
+        var code: Int
+        var mods: Int       // Carbon modifier mask
+        var char: String    // key as typed, lowercase (empty for keys without a printable character)
+
+        static let standard = HotKey(code: kVK_ANSI_4, mods: cmdKey | optionKey, char: "4")
+
+        var label: String {
+            var s = ""
+            if mods & controlKey != 0 { s += "⌃" }
+            if mods & optionKey != 0 { s += "⌥" }
+            if mods & shiftKey != 0 { s += "⇧" }
+            if mods & cmdKey != 0 { s += "⌘" }
+            return s + (char.isEmpty ? "key \(code)" : char.uppercased())
+        }
+
+        var menuModifiers: NSEvent.ModifierFlags {
+            var f: NSEvent.ModifierFlags = []
+            if mods & controlKey != 0 { f.insert(.control) }
+            if mods & optionKey != 0 { f.insert(.option) }
+            if mods & shiftKey != 0 { f.insert(.shift) }
+            if mods & cmdKey != 0 { f.insert(.command) }
+            return f
+        }
+    }
+
+    private var captureHotKey: HotKey {
+        get {
+            let d = UserDefaults.standard
+            guard d.object(forKey: "hotKeyCode") != nil else { return .standard }
+            return HotKey(code: d.integer(forKey: "hotKeyCode"), mods: d.integer(forKey: "hotKeyMods"),
+                          char: d.string(forKey: "hotKeyChar") ?? "")
+        }
+        set {
+            let d = UserDefaults.standard
+            d.set(newValue.code, forKey: "hotKeyCode")
+            d.set(newValue.mods, forKey: "hotKeyMods")
+            d.set(newValue.char, forKey: "hotKeyChar")
+        }
+    }
+
+    /// Global hot key (⌥⌘4 by default), works while another app is in front (Carbon hot keys need no extra permission).
     private func registerCaptureHotKey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
             DispatchQueue.main.async { (NSApp.delegate as? AppDelegate)?.captureArea() }
             return noErr
         }, 1, &spec, nil, nil)
-        let id = EventHotKeyID(signature: OSType(0x50565748), id: 1)
-        RegisterEventHotKey(UInt32(kVK_ANSI_4), UInt32(cmdKey | optionKey), id,
-                            GetApplicationEventTarget(), 0, &hotKeyRef)
+        if !registerHotKey(captureHotKey) {
+            // The saved combination is taken by something else: fall back to the standard one.
+            _ = registerHotKey(.standard)
+            hotKeyTaken = true
+        }
     }
+
+    private var hotKeyTaken = false
+
+    private func registerHotKey(_ key: HotKey) -> Bool {
+        if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
+        let id = EventHotKeyID(signature: OSType(0x50565748), id: 1)
+        return RegisterEventHotKey(UInt32(key.code), UInt32(key.mods), id,
+                                   GetApplicationEventTarget(), 0, &hotKeyRef) == noErr
+    }
+
+    /// The menu items show the current hot key.
+    private func applyHotKeyToMenus() {
+        let key = captureHotKey
+        let printable = key.char.unicodeScalars.count == 1 && (key.char.unicodeScalars.first!.value > 32)
+            && key.char.unicodeScalars.first!.value < 127
+        func update(_ menu: NSMenu?) {
+            for item in menu?.items ?? [] {
+                if item.action == #selector(captureArea) {
+                    item.keyEquivalent = printable ? key.char : ""
+                    item.keyEquivalentModifierMask = printable ? key.menuModifiers : []
+                }
+                update(item.submenu)
+            }
+        }
+        update(NSApp.mainMenu)
+        update(statusItem?.menu)
+        captureButton?.toolTip = "Capture a screen area (\(key.label))"
+    }
+
+    @objc func setCaptureHotKey() {
+        showWindowIfNeededForDialog()
+        let alert = NSAlert()
+        alert.messageText = "Set Capture Hot Key"
+        alert.informativeText = "Press the combination you want. It needs ⌘, ⌥ or ⌃ together with a key."
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        let label = NSTextField(labelWithString: captureHotKey.label)
+        label.font = .systemFont(ofSize: 22, weight: .medium)
+        label.alignment = .center
+        label.frame = NSRect(x: 0, y: 0, width: 220, height: 32)
+        alert.accessoryView = label
+        var picked: HotKey?
+        alert.buttons[0].isEnabled = false
+        let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let f = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard f.contains(.command) || f.contains(.option) || f.contains(.control) else { return nil }
+            var mods = 0
+            if f.contains(.command) { mods |= cmdKey }
+            if f.contains(.option) { mods |= optionKey }
+            if f.contains(.control) { mods |= controlKey }
+            if f.contains(.shift) { mods |= shiftKey }
+            var ch = event.charactersIgnoringModifiers?.lowercased() ?? ""
+            if ch.unicodeScalars.count != 1 || ch.unicodeScalars.first!.value <= 32 || ch.unicodeScalars.first!.value >= 127 { ch = "" }
+            let key = HotKey(code: Int(event.keyCode), mods: mods, char: ch)
+            picked = key
+            label.stringValue = key.label
+            alert.buttons[0].isEnabled = true
+            return nil
+        }
+        let response = alert.runModal()
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        guard response == .alertFirstButtonReturn, let new = picked else { return }
+        let old = captureHotKey
+        if registerHotKey(new) {
+            captureHotKey = new
+            hotKeyTaken = false
+            applyHotKeyToMenus()
+        } else {
+            _ = registerHotKey(old)
+            let warn = NSAlert()
+            warn.messageText = "\(new.label) is already in use"
+            warn.informativeText = "Another program owns this combination. The hot key stays \(old.label)."
+            warn.runModal()
+        }
+    }
+
+    private func showWindowIfNeededForDialog() { NSApp.activate(ignoringOtherApps: true) }
 
     private var toastToken = 0
 
@@ -2212,8 +2718,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         case #selector(printImage), #selector(fitToWindow), #selector(actualSize),
              #selector(zoomIn), #selector(zoomOut), #selector(rotateLeft), #selector(rotateRight),
              #selector(copyImage), #selector(flipHorizontal), #selector(flipVertical),
-             #selector(cropAction), #selector(showAdjust), #selector(saveImage), #selector(saveCopy):
+             #selector(cropAction), #selector(showAdjust), #selector(saveImage), #selector(saveCopy),
+             #selector(showRotateAny), #selector(showExpand):
             return currentImage != nil
+        case #selector(closePicture):
+            return !files.isEmpty
         case #selector(undoEdit):
             return !undoStack.isEmpty
         default: return true
@@ -2254,6 +2763,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let file = submenu("File")
         add(file, "Open…", #selector(openPanel), "o")
         add(file, "Capture Screen Area", #selector(captureArea), "4", [.command, .option])
+        add(file, "Set Capture Hot Key…", #selector(setCaptureHotKey))
         add(file, "Copy Captures to Clipboard", #selector(toggleCopyCaptures))
         file.addItem(.separator())
         add(file, "Page Setup…", #selector(pageSetup), "p", [.command, .shift])
@@ -2265,6 +2775,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         add(file, "Show in Finder", #selector(revealInFinder), "r")
         add(file, "Move to Trash", #selector(moveToTrash), "\u{8}")
         file.addItem(.separator())
+        add(file, "Close Picture", #selector(closePicture), "w", [.command, .shift])
         add(file, "Close", #selector(NSWindow.performClose(_:)), "w")
 
         let edit = submenu("Edit")
@@ -2277,6 +2788,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         add(edit, "Flip Horizontally", #selector(flipHorizontal))
         add(edit, "Flip Vertically", #selector(flipVertical))
         add(edit, "Adjust Colors…", #selector(showAdjust))
+        add(edit, "Rotate by Any Angle…", #selector(showRotateAny))
+        add(edit, "Expand Canvas…", #selector(showExpand))
 
         let view = submenu("View")
         add(view, "Previous Picture", #selector(previous), arrow(NSLeftArrowFunctionKey), [])
@@ -2303,6 +2816,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         NSApp.windowsMenu = win
 
         NSApp.mainMenu = main
+        applyHotKeyToMenus()
     }
 }
 

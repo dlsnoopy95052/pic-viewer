@@ -36,5 +36,13 @@ _Avoid_: Rotate (as a pixel operation)
 Add or change Annotations. Non-destructive until the Picture is flattened.
 
 **Edit**:
-Change the Picture's pixels directly: crop, flip, brightness, contrast, saturation. Starting an Edit flattens the Picture first.
+Change the Picture's pixels directly: crop, rotate by any angle, expand the canvas, flip, brightness, contrast, saturation. Starting an Edit flattens the Picture first.
 _Avoid_: Adjust (as the general term)
+
+**Expand canvas**:
+An Edit that adds empty space around the Picture, so Annotations and Pasted layers can go outside the original. The new area is white, black or transparent.
+_Avoid_: Resize, pad
+
+**Close**:
+Empty the viewer of the open Picture. While a Picture is open a Capture only goes to the clipboard, to be pasted onto it; with nothing open the Capture opens on its own.
+_Avoid_: Quit (that exits the app)

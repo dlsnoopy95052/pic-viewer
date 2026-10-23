@@ -10,7 +10,7 @@ A small native macOS picture viewer with light annotation and editing, written i
 - Browse every picture in the same folder with on-screen arrows or ← / →; drag & drop to open
 - Fit / actual size / zoom / pan
 - Lives in the menu bar: no window or Dock icon until you open or capture a picture; closing the window returns to the menu bar, and ⌘Q quits. Turn on **Open at Login** (menu bar icon or app menu, macOS 13+) to have it ready after sign-in
-- Capture a screen area with the global hot key ⌥⌘4 (works while another app is in front); the capture is copied to the clipboard (toggle in the File menu); if a picture is already open it stays put so you can paste the capture onto it with ⌘V, otherwise the capture opens here to annotate and edit. Needs Screen Recording permission on first use
+- Capture a screen area with the global hot key ⌥⌘4 (works while another app is in front; change it with **Set Capture Hot Key…** in the menu bar or File menu); the capture is copied to the clipboard (toggle in the File menu); if a picture is already open it stays put so you can paste the capture onto it with ⌘V, otherwise the capture opens here to annotate and edit. Needs Screen Recording permission on first use
 - Icon toolbar (top right) for capture, rotate, zoom, fit, slideshow, info, thumbnails, copy, paste, rename, trash
 - Info panel with file / EXIF details, thumbnail strip, slideshow
 - Printing with live preview, paper & orientation selection, shrink-to-fit, fit, actual size, fill, centering
@@ -29,8 +29,12 @@ Annotations stay editable until the picture is flattened.
 
 Editing changes the picture's pixels, so it flattens any annotations first.
 
-- Crop, flip horizontally / vertically, brightness / contrast / saturation
+- Crop: drag the area, then move it or drag its handles; click Crop again or press Enter to apply, Esc cancels. Shape: Free, Original, 1:1, 4:3, 3:2, 16:9, 5:4, a swap for landscape / portrait, or a **Custom Size** in pixels (the crop is scaled to exactly that size)
+- **Rotate by any angle** (toolbar or Edit menu): slider from −45° to +45° with 0.1° nudges and live preview. The whole picture is kept and the empty corners are transparent, so crop afterwards
+- **Expand canvas**: add space on any side, filled white, black or transparent
+- Flip horizontally / vertically, brightness / contrast / saturation
 - Undo, save, or save a copy
+- **Close Picture** (⇧⌘W or the ✕ button) empties the viewer; with nothing open a Capture opens on its own instead of waiting to be pasted
 
 ## Keyboard shortcuts
 
@@ -43,7 +47,7 @@ Editing changes the picture's pixels, so it flattens any annotations first.
 | Rename | ⌘E |
 | Show in Finder | ⌘R |
 | Move to Trash | ⌘⌫ |
-| Close | ⌘W |
+| Close window / Close Picture | ⌘W / ⇧⌘W |
 | Undo | ⌘Z |
 | Copy / Paste | ⌘C / ⌘V |
 | Crop | ⌘K |
