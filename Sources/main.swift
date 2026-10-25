@@ -2149,6 +2149,11 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
     /// Empty the viewer. A Capture then opens on its own instead of waiting to be pasted.
     @objc func closePicture() {
         guard !files.isEmpty, confirmDiscard() else { return }
+        emptyViewer()
+    }
+
+    /// Reset the viewer to its empty state, without asking about unsaved edits.
+    private func emptyViewer() {
         if slideshowTimer != nil { toggleSlideshow() }
         files = []
         index = 0
@@ -2749,8 +2754,7 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
             guard error == nil else { NSSound.beep(); return }
             files.remove(at: index)
             if files.isEmpty {
-                currentImage = nil; canvas.image = nil; window.title = "Picture Viewer"
-                prevButton.isEnabled = false; nextButton.isEnabled = false
+                emptyViewer()
             } else {
                 index = min(index, files.count - 1)
                 reloadStrip()
