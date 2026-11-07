@@ -34,7 +34,7 @@ Editing changes the picture's pixels, so it flattens any annotations first.
 - **Rotate by any angle** (toolbar or Edit menu): slider from −45° to +45° with 0.1° nudges and live preview. The whole picture is kept and the empty corners are transparent, so crop afterwards
 - **Expand canvas**: add space on any side, filled white, black or transparent
 - Flip horizontally / vertically, brightness / contrast / saturation
-- Undo, save, or save a copy
+- Undo, save, or save a copy straight into a destination folder (default Pictures; set via File ▸ Set Destination for Save a Copy… or the Dock icon menu)
 - **Close Picture** (⇧⌘W or the ✕ button) empties the viewer; with nothing open a Capture opens on its own instead of waiting to be pasted
 
 ## Keyboard shortcuts

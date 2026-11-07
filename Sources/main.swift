@@ -1647,7 +1647,7 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
             adjustButton,
             tool("arrow.uturn.backward", "Undo (⌘Z)", #selector(undoEdit)),
             tool("square.and.arrow.down", "Save (⌘S)", #selector(saveImage)),
-            tool("square.and.arrow.down.on.square", "Save a copy… (⇧⌘S)", #selector(saveCopy)),
+            tool("square.and.arrow.down.on.square", "Save a copy (⇧⌘S)", #selector(saveCopy)),
         ], in: .leading)
         editBar.spacing = 2
         editBar.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
@@ -2355,26 +2355,58 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
         }
     }
 
+    /// Where "Save a Copy" puts files. Defaults to Pictures; persists across launches.
+    private var saveCopyFolder: URL {
+        get {
+            if let path = UserDefaults.standard.string(forKey: "saveCopyFolder"),
+               FileManager.default.fileExists(atPath: path) {
+                return URL(fileURLWithPath: path, isDirectory: true)
+            }
+            return FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first
+                ?? FileManager.default.homeDirectoryForCurrentUser
+        }
+        set { UserDefaults.standard.set(newValue.path, forKey: "saveCopyFolder") }
+    }
+
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let m = NSMenu()
+        let item = NSMenuItem(title: "Set Destination for Save a Copy…", action: #selector(setSaveCopyFolder), keyEquivalent: "")
+        item.target = self
+        m.addItem(item)
+        return m
+    }
+
+    @objc func setSaveCopyFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        panel.message = "Choose the destination folder for Save a Copy."
+        panel.directoryURL = saveCopyFolder
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        saveCopyFolder = url
+    }
+
     @objc func saveCopy() {
         guard files.indices.contains(index), let img = canvas.rotatedImage else { NSSound.beep(); return }
         let src = files[index]
         let ext = ImageEdit.writableExtensions.contains(src.pathExtension.lowercased())
             ? src.pathExtension.lowercased() : "png"
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.png, .jpeg, .tiff]
-        if isPasted(src) {
-            panel.directoryURL = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first
-            panel.nameFieldStringValue = src.deletingPathExtension().lastPathComponent + "." + ext
-        } else {
-            panel.directoryURL = src.deletingLastPathComponent()
-            panel.nameFieldStringValue = src.deletingPathExtension().lastPathComponent + " edited." + ext
+        // No dialog: the copy goes straight into the destination folder, with a unique name.
+        let base = src.deletingPathExtension().lastPathComponent + (isPasted(src) ? "" : " edited")
+        var dest = saveCopyFolder.appendingPathComponent(base + "." + ext)
+        var n = 2
+        while FileManager.default.fileExists(atPath: dest.path) {
+            dest = saveCopyFolder.appendingPathComponent("\(base) \(n)." + ext)
+            n += 1
         }
-        guard panel.runModal() == .OK, let dest = panel.url else { return }
         guard let data = ImageEdit.encode(img, as: dest.pathExtension) else { NSSound.beep(); return }
         do {
             try data.write(to: dest, options: .atomic)
             edited = false
             open(dest)
+            showToast("Saved a copy to \(dest.deletingLastPathComponent().lastPathComponent)")
         } catch {
             NSAlert(error: error).runModal()
         }
@@ -2797,6 +2829,9 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
             let pb = NSPasteboard.general
             return NSImage.canInit(with: pb)
                 || pb.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+        case #selector(setSaveCopyFolder):
+            item.title = "Set Destination for Save a Copy… (\(saveCopyFolder.lastPathComponent))"
+            return true
         case #selector(toggleOpenAtLogin):
             guard #available(macOS 13.0, *) else { return false }
             item.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -2867,7 +2902,8 @@ final class AppDelegate: NSObject,NSApplicationDelegate, NSWindowDelegate, NSMen
         add(file, "Print…", #selector(printImage), "p")
         file.addItem(.separator())
         add(file, "Save…", #selector(saveImage), "s")
-        add(file, "Save a Copy…", #selector(saveCopy), "s", [.command, .shift])
+        add(file, "Save a Copy", #selector(saveCopy), "s", [.command, .shift])
+        add(file, "Set Destination for Save a Copy…", #selector(setSaveCopyFolder))
         add(file, "Rename…", #selector(renameFile), "e")
         add(file, "Show in Finder", #selector(revealInFinder), "r")
         add(file, "Move to Trash", #selector(moveToTrash), "\u{8}")
